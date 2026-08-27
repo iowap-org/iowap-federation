@@ -172,13 +172,19 @@ the only component that touches the network.
 
 ## Transport abstraction
 
+> **Location (2026-08-27):** the Federation code lives in the
+> `iowap-federation` repo as its own package `federation/`, importing
+> `nodes.common.*` from the iowap-node framework (same pattern as
+> iowap-storage). The `nodes/common/federation/` paths in this doc are
+> historical.
+
 The `Transport` interface mirrors the pluggable database abstraction in the
 server (`core/db.py`): a `Database` protocol → `create_database()` factory on
 `db_type`. Here it is a `Transport` protocol → `create_transport()` factory on
 `transport_type`.
 
 ```python
-# nodes/common/federation/transport.py
+# federation/transport.py   (was: nodes/common/federation/transport.py)
 class Transport:
     """Pluggable federation transport backend.
 
@@ -212,7 +218,8 @@ class Transport:
 def create_transport(cfg: dict[str, Any]) -> Transport:
     transport_type = cfg.get("federation.transport_type", "http")
     if transport_type == "http":
-        from nodes.common.federation.transports.http_transport import HttpTransport
+        from federation.transports.http_transport import HttpTransport
+        # (was: from nodes.common.federation.transports.http_transport import HttpTransport)
         return HttpTransport(cfg)
     # if transport_type == "email":   # T-100
     #     from ...email_transport import EmailTransport
@@ -682,9 +689,14 @@ manual approval (default no import), E2EE, Inbox/Outbox.
 
 ## What the Federation Node needs (node code, no relay code)
 
-- `nodes/common/federation/transport.py` — `Transport` protocol + `create_transport()` factory
-- `nodes/common/federation/transports/http_transport.py` — HTTP backend (V1)
-- `nodes/common/federation/federation_node.py` — Daemon (claim, forward, complete; inbox/outbox processing)
+> **Location (2026-08-27):** these paths are historical (`nodes/common/federation/`
+> in iowap-node). The code now lives in the `iowap-federation` repo as the
+> `federation/` package, importing `nodes.common.*` from the iowap-node
+> framework (same pattern as iowap-storage).
+
+- `federation/transport.py` — `Transport` protocol + `create_transport()` factory
+- `federation/transports/http_transport.py` — HTTP backend (V1)
+- `federation/federation_node.py` — Daemon (claim, forward, complete; inbox/outbox processing)
 - `federation` handler — peer management, capability discovery
 - Dashboard HTML (capability page or Dynamic Route) — subscription catalog, peer status
 - Fair-use policy — `max_parallel`, `max_daily` enforcement in the daemon
