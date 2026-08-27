@@ -40,6 +40,20 @@ capability, even though it's executed on a remote relay.
 
 The full design document lives in **[docs/federation.md](docs/federation.md)**.
 
+## Package structure
+
+```
+federation/
+├── transport.py          # Transport protocol + create_transport() factory
+├── paths.py              # inbox/outbox directory layout per remote
+└── transports/
+    ├── http_transport.py # HTTP backend (T-095)
+    └── ...               # email (T-100), p2p (later)
+```
+
+The node is transport-agnostic — it only reads/writes JSON files in
+`inbox/`/`outbox/`. The `Transport` wrapper is the only network component.
+
 ## Status
 
 | Phase | Scope | Tasks | Status |
