@@ -166,9 +166,24 @@ the only component that touches the network.
 
 ```
 ~/.relay/federation/<remote-relay-name>/
-├── inbox/      # results from remote relay → node processes → completes stage
-└── outbox/     # task forwards → wrapper syncs out
+├── inbox/      # results/tasks from remote (hash-partitioned: <SHA256(message_id)[:2]>/<message_id>.json)
+├── outbox/     # task forwards (hash-partitioned: <SHA256(message_id)[:2]>/<message_id>.json)
+├── archive/    # terminal-state files (flat, T-102/T-103)
+└── state.db    # SQLite metadata index (T-103)
 ```
+
+> **Implementation status (T-103, 2026-08-27):** the SQLite metadata index
+> (`federation/index.py`) holds message metadata; files hold payloads.
+> Hash-partitioning uses `SHA256(message_id)[:2]` → 256 buckets. The
+> daemon wires the index optionally (``FederationDaemon(index=...)``):
+> forward writes use the partitioned outbox path and insert a metadata
+> row; the transport mirrors ACK outcomes (accepted→ARCHIVED,
+> rejected→REJECTED, exhausted retries→FAILED) into the index; the
+> listener inserts + marks-processed every accepted inbox POST. The sync
+> cycle runs an aggressive archive+prune sweep for terminal-state
+> messages. ``count_in_flight`` / ``count_today`` back the heartbeat and
+> the fair-use daily cap (superseding the in-memory counters). Atomic
+> writes (``.tmp_<id>`` + ``os.replace``) are preserved everywhere.
 
 ## Transport abstraction
 

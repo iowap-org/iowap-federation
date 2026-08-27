@@ -70,6 +70,11 @@ from federation.config import NodeConfig, Peer, load_node_config
 from federation.crypto import Crypto, CryptoError
 from federation.envelope import open as envelope_open
 from federation.fairuse import FairUseRegistry
+from federation.index import (
+    MetadataIndex,
+    ensure_partition_dir,
+    partition_path as _partition_path,
+)
 from federation.lifecycle import (
     Lifecycle,
     LifecycleRegistry,
@@ -80,6 +85,7 @@ from federation.lifecycle import (
     emit_event,
 )
 from federation.paths import (
+    archive_dir as _archive_dir,
     ensure_federation_dirs,
     federation_root,
     remote_dirs,
@@ -215,6 +221,7 @@ class FederationDaemon:
         intervals: dict[str, float] | None = None,
         fairuse_registry: FairUseRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        index: "MetadataIndex | None" = None,
     ) -> None:
         self.client = client
         self.cfg = cfg
@@ -241,11 +248,28 @@ class FederationDaemon:
         self.replay_guard = ReplayGuard()
         self.retry_policy = retry_policy or RetryPolicy()
 
+        # T-103 SQLite metadata index. Optional: when ``None`` the daemon
+        # keeps the in-memory counters + correlation (T-096 behaviour). When
+        # supplied, the daemon mirrors message metadata into it, uses it for
+        # durable in-flight / today counts (replacing the in-memory
+        # ``_in_flight`` for the heartbeat), advances state via
+        # ``update_state`` on every transition, and runs an aggressive
+        # archive+prune sweep on the sync cycle. A ``MetadataIndex`` built
+        # per remote (``state.db``) may be passed in; the daemon owns the
+        # archival file sweep.
+        self.index = index
+
         iv = intervals or {}
         self.heartbeat_interval = iv.get("heartbeat", HEARTBEAT_INTERVAL)
         self.claim_interval = iv.get("claim", CLAIM_INTERVAL)
         self.sync_interval = iv.get("sync", SYNC_INTERVAL)
         self.inbox_interval = iv.get("inbox", INBOX_INTERVAL)
+
+        # T-103: TTL for the index prune sweep (seconds). Default 7 days —
+        # long enough for forensics, short enough to bound the index. The
+        # terminal-state archival happens immediately on every sync cycle;
+        # this TTL only controls when the *metadata rows* are reaped.
+        self._ttl_seconds = float(iv.get("index_ttl", 7 * 24 * 3600))
 
         # Thread coordination.
         self._stop_event = threading.Event()
@@ -335,6 +359,10 @@ class FederationDaemon:
         registers a :class:`Lifecycle` for the new message (state
         ``CREATED`` → ``QUEUED``). Returns ``None`` if the stage is
         unroutable.
+
+        T-103: when an index is wired, the outbox file is written to the
+        hash-partitioned path ``outbox/<SHA256(message_id)[:2]>/<id>.json``
+        and a metadata row is inserted into the index.
         """
         peer_obj = peer
         inbox, outbox = ensure_federation_dirs(peer_obj.id)
@@ -342,7 +370,7 @@ class FederationDaemon:
         message_id = envelope["message_id"]
         stage_id = envelope["_origin"]["stage_id"]
         task_id = envelope["_origin"]["task_id"]
-        dest = outbox / f"{message_id}.json"
+        dest = self._outbox_path(outbox, message_id)
         atomic_write_json(dest, envelope)
         # Register + advance the lifecycle tracker.
         lc = Lifecycle(message_id=message_id, state=MessageState.CREATED)
@@ -364,6 +392,23 @@ class FederationDaemon:
                     lc.queued()
                 except Exception:  # noqa: BLE001
                     pass
+        # T-103: mirror metadata into the index (state QUEUED). Idempotent
+        # insert (INSERT OR IGNORE); update_state advances if it existed.
+        if self.index is not None:
+            try:
+                self.index.insert(
+                    message_id,
+                    state=MessageState.QUEUED,
+                    type=envelope.get("type"),
+                    remote=peer_obj.id,
+                    capability=envelope.get("capability"),
+                    remote_task_id=envelope.get("remote_task_id"),
+                    schema_hash=envelope.get("schema_hash"),
+                    created_at=envelope.get("created_at"),
+                )
+                self.index.update_state(message_id, MessageState.QUEUED)
+            except Exception as exc:  # noqa: BLE001 — index must not crash the flow
+                log.warning("index insert failed for %s: %s", message_id, exc)
         # Record correlation so the reply can complete our stage.
         if stage_id:
             with self._lock:
@@ -376,6 +421,18 @@ class FederationDaemon:
             message_id, peer_obj.id, envelope["capability"], stage_id,
         )
         return message_id
+
+    def _outbox_path(self, outbox: Path, message_id: str) -> Path:
+        """Return the outbox file path for ``message_id``.
+
+        T-103: hash-partitioned when an index is wired (so reads/writes/
+        archival all use the partitioned layout); flat (legacy) otherwise so
+        existing tests/transport paths keep working unchanged.
+        """
+        if self.index is not None:
+            ensure_partition_dir(outbox, message_id)
+            return _partition_path(outbox, message_id)
+        return outbox / f"{message_id}.json"
 
     def _claim_and_forward(self, capability: str) -> None:
         """Claim one stage for ``capability`` and forward it to a peer's outbox.
@@ -493,7 +550,8 @@ class FederationDaemon:
         if not message_id:
             log.warning("inbox file %s has no message_id — skipping", path.name)
             return "skipped"
-        # Replay dedupe (T-102: TTL-pruned ReplayGuard).
+        # Replay dedupe (T-102: TTL-pruned ReplayGuard). T-103 adds a durable
+        # ``mark_processed`` flag as a crash-recoverable second layer.
         if not self.replay_guard.check_and_add(message_id):
             log.info("duplicate message_id=%s — ignoring", message_id)
             try:
@@ -506,6 +564,31 @@ class FederationDaemon:
         etype = str(envelope.get("type") or "")
         capability = str(envelope.get("capability") or "")
         payload = envelope.get("payload") or {}
+
+        # T-103: index the incoming message (receiver side). ``mark_processed``
+        # is set after the action succeeds; here we insert the metadata row.
+        # ``remote_task_id`` is stored only for forward/task messages — a
+        # reply's ``remote_task_id`` is the *sender's* stage correlation id,
+        # and indexing it would shadow the forward message's row in
+        # ``get_by_remote_task_id`` (used to advance the forward to COMPLETED).
+        if self.index is not None:
+            is_task = direction == "forward" or etype == "task"
+            try:
+                self.index.insert(
+                    message_id,
+                    state=MessageState.CREATED,
+                    type=etype or None,
+                    remote=peer.id,
+                    capability=capability or None,
+                    remote_task_id=(
+                        str(envelope.get("remote_task_id") or "")
+                        or None
+                    ) if is_task else None,
+                    schema_hash=envelope.get("schema_hash"),
+                    created_at=envelope.get("created_at"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("index insert (inbox) failed for %s: %s", message_id, exc)
 
         if direction == "forward" or etype == "task":
             # Remote sent us a task → re-submit as a normal task into our
@@ -533,6 +616,11 @@ class FederationDaemon:
                     message_id, capability,
                 )
                 action = "submitted"
+                if self.index is not None:
+                    try:
+                        self.index.mark_processed(message_id)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("index mark_processed %s: %s", message_id, exc)
             except Exception as exc:  # noqa: BLE001
                 log.error(
                     "submit_simple_task failed for message_id=%s: %s",
@@ -583,6 +671,19 @@ class FederationDaemon:
                         if rel_policy is not None:
                             rel_policy.release()
                         action = "completed"
+                        # T-103: mark the reply message processed (receiver
+                        # side) + advance the forward message's index row to
+                        # COMPLETED (correlated via remote_task_id).
+                        if self.index is not None:
+                            try:
+                                self.index.mark_processed(message_id)
+                                fwd_row = self.index.get_by_remote_task_id(remote_task_id)
+                                if fwd_row is not None:
+                                    self.index.update_state(
+                                        fwd_row["message_id"], MessageState.COMPLETED
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                log.debug("index reply-completion %s: %s", message_id, exc)
                     except Exception as exc:  # noqa: BLE001
                         # Put it back so a later retry can complete.
                         with self._lock:
@@ -611,12 +712,17 @@ class FederationDaemon:
         return action
 
     def _process_inbox(self, peer: Peer) -> int:
-        """Drain one peer's inbox. Returns the number of files processed."""
+        """Drain one peer's inbox. Returns the number of files processed.
+
+        T-103: scans recursively so both the legacy flat layout and the
+        hash-partitioned layout (``inbox/<xx>/<message_id>.json``) are
+        drained.
+        """
         inbox, _ = remote_dirs(peer.id)
         if not inbox.is_dir():
             return 0
         count = 0
-        for f in sorted(inbox.iterdir()):
+        for f in sorted(inbox.rglob("*.json")):
             if not f.is_file() or f.name.startswith("."):
                 continue
             self._process_inbox_file(peer, f)
@@ -656,6 +762,7 @@ class FederationDaemon:
             ("crypto", crypto),
             ("registry", self.lifecycle),
             ("retry_policy", self.retry_policy),
+            ("index", self.index),  # T-103: transport mirrors state in the index
         ):
             if hasattr(t, attr):
                 setattr(t, attr, value)
@@ -663,13 +770,18 @@ class FederationDaemon:
         return t
 
     def _sync_one_peer(self, peer: Peer) -> dict[str, list[str]]:
-        """Run one sync cycle for a peer: outbox → inbox.
+        """Run one sync cycle for a peer: outbox → inbox → cleanup.
 
         Returns ``{"sent": [...], "received": [...]}``. T-102: the
         transport drives the ACK/retry lifecycle internally; here we
         advance any tracked messages from ``QUEUED`` → ``SENT`` for the
         ids the transport reports as accepted, and move async ones to
         ``PENDING_REMOTE_RESPONSE``.
+
+        T-103: when an index is wired, mirror the SENT state into the index
+        for accepted sends and run an aggressive archive+prune sweep for
+        terminal-state messages of this peer (move payload files to
+        ``archive/`` and reap the metadata rows).
         """
         inbox, outbox = remote_dirs(peer.id)
         outbox.mkdir(parents=True, exist_ok=True)
@@ -690,7 +802,58 @@ class FederationDaemon:
                     lc.sent()
                 except Exception:  # noqa: BLE001
                     pass
+            # T-103: mirror SENT into the index (the transport may already
+            # have advanced it further via the ACK handler).
+            if self.index is not None:
+                try:
+                    cur = self.index.get_state(mid)
+                    if cur in (None, MessageState.QUEUED.value):
+                        self.index.update_state(mid, MessageState.SENT)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("index SENT mirror %s: %s", mid, exc)
+        # T-103: aggressive cleanup/archival of terminal-state messages.
+        if self.index is not None:
+            self._archive_terminal(peer)
         return {"sent": list(sent), "received": list(received)}
+
+    def _archive_terminal(self, peer: Peer) -> int:
+        """Archive payload files for terminal-state messages + prune TTL.
+
+        For each terminal-state row in the index for this peer: move the
+        payload file (outbox for forwards we sent, inbox for messages we
+        received) to ``archive/`` (flat), then let ``prune_ttl`` reap the
+        metadata rows. Returns the number of payloads archived.
+
+        Aggressive cleanup per the master plan: a message that has reached
+        ARCHIVED/FAILED/EXPIRED/REJECTED has no live work; its payload file
+        is dead weight and is moved out of inbox/outbox immediately.
+        """
+        if self.index is None:
+            return 0
+        archived = 0
+        try:
+            rows = self.index.terminal_messages(remote=peer.id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("index terminal_messages failed: %s", exc)
+            return 0
+        archive = _archive_dir(peer.id)
+        inbox, outbox = remote_dirs(peer.id)
+        for row in rows:
+            mid = row["message_id"]
+            # Outbox file (we sent it) — partitioned layout.
+            if MetadataIndex.archive_payload(outbox, mid, archive):
+                archived += 1
+            # Inbox file (we received it) — partitioned layout.
+            if MetadataIndex.archive_payload(inbox, mid, archive):
+                archived += 1
+        # Reap terminal + processed rows older than the TTL. A long TTL
+        # (default 7d) keeps forensic history; the sweep above already
+        # moved files, so the prune only removes metadata rows.
+        try:
+            self.index.prune_ttl(self._ttl_seconds)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("index prune_ttl failed: %s", exc)
+        return archived
 
     # ------------------------------------------------------------------ #
     # Status
@@ -735,6 +898,29 @@ class FederationDaemon:
             "error": error,
             "auth_backoff_seconds": backoff,
         }
+        # T-103: index-backed counts when a MetadataIndex is wired.
+        if self.index is not None:
+            try:
+                status["index"] = {
+                    "tracked": sum(
+                        self.index.count_in_state(s)
+                        for s in (
+                            MessageState.CREATED, MessageState.ENCRYPTED,
+                            MessageState.QUEUED, MessageState.SENT,
+                            MessageState.PENDING_REMOTE_RESPONSE,
+                            MessageState.ACKED, MessageState.COMPLETED,
+                            MessageState.ARCHIVED, MessageState.FAILED,
+                            MessageState.EXPIRED, MessageState.REJECTED,
+                        )
+                    ),
+                    "in_flight": self.index.count_in_flight(),
+                    "today": self.index.count_today(),
+                    "archived": self.index.count_in_state(MessageState.ARCHIVED),
+                    "failed": self.index.count_in_state(MessageState.FAILED),
+                    "rejected": self.index.count_in_state(MessageState.REJECTED),
+                }
+            except Exception as exc:  # noqa: BLE001
+                log.debug("status index counts failed: %s", exc)
         try:
             _atomic_write_json(status_path, status)
         except OSError as exc:
@@ -753,8 +939,7 @@ class FederationDaemon:
             error: str | None = None
             try:
                 self.client.maybe_refresh_token()
-                with self._lock:
-                    inflight = dict(self._in_flight)
+                inflight = self._in_flight_map()
                 hb = self.client.heartbeat(caps, inflight)
                 self.last_heartbeat_status = str(hb.get("status", "ok"))
                 log.info("heartbeat %s", self.last_heartbeat_status)
@@ -763,6 +948,39 @@ class FederationDaemon:
                 log.error("heartbeat error: %s", exc)
             self._write_status(error=error)
             self._sleep(self.heartbeat_interval + backoff_of(self.client))
+
+    def _in_flight_map(self) -> dict[str, int]:
+        """Build the ``in_flight`` heartbeat map.
+
+        T-103: when an index is wired, the durable ``count_in_flight``
+        supersedes the in-memory ``_in_flight`` dict (a crashed in-flight
+        task is re-claimed on restart, so the in-memory counter is only an
+        approximation). We still blend the in-memory count for the
+        synthetic ``federation`` capability (it has no index rows of its
+        own — the index tracks per-message forwards, the heartbeat wants
+        the aggregate). When no index is wired, fall back to the
+        in-memory dict (T-096 behaviour).
+        """
+        with self._lock:
+            mem = dict(self._in_flight)
+        if self.index is None:
+            return mem
+        # Index-backed: count in-flight messages per capability across all
+        # peers, plus the synthetic federation aggregate.
+        try:
+            caps = set(self.forward_caps) | {c for c in mem if c != FEDERATION_CAP}
+            out: dict[str, int] = {FEDERATION_CAP: 0}
+            for cap in caps:
+                if not cap:
+                    continue
+                out[cap] = self.index.count_in_flight(capability=cap)
+            # The federation aggregate: in-memory counter (claimed but not
+            # yet forwarded) is the source of truth for the synthetic cap.
+            out[FEDERATION_CAP] = mem.get(FEDERATION_CAP, 0)
+            return out
+        except Exception as exc:  # noqa: BLE001 — index must not break the heartbeat
+            log.warning("index count_in_flight failed: %s — using in-memory", exc)
+            return mem
 
     def _claim_loop(self) -> None:
         """Thread 2: claim stages for approved caps → forward to outbox."""

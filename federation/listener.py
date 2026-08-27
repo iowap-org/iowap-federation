@@ -56,7 +56,9 @@ from federation.ack import (
 from federation.config import NodeConfig, load_node_config
 from federation.crypto import Crypto, CryptoError, SizeGuard
 from federation.envelope import open as envelope_open
+from federation.index import MetadataIndex
 from federation.lifecycle import (
+    MessageState,
     ReplayGuard,
     atomic_write_bytes,
     emit_event,
@@ -86,6 +88,7 @@ def create_listener_app(
     size_guard: SizeGuard | None = None,
     replay_guard: ReplayGuard | None = None,
     receiver_ack: ReceiverAck | None = None,
+    index: MetadataIndex | None = None,
 ) -> FastAPI:
     """Build the FedNode listener FastAPI app.
 
@@ -130,6 +133,9 @@ def create_listener_app(
         "size_guard": guard,
         "replay_guard": replay,
         "receiver_ack": ack_ledger,
+        # T-103 metadata index (optional). When wired, every accepted inbox
+        # POST inserts a metadata row (receiver side) + is marked processed.
+        "index": index,
         # Results the local relay has produced and exposed for polling.
         # T-095/T-096: populating this is the daemon's job; the listener
         # only needs to return them when present.
@@ -223,6 +229,32 @@ def create_listener_app(
         dest = Path(state["inbox_dir"]) / f"{message_id}.json"
         payload_bytes = json.dumps(envelope, sort_keys=True).encode("utf-8")
         atomic_write_bytes(dest, payload_bytes)
+        # T-103: index the accepted message (receiver side). ``mark_processed``
+        # is set here because the inbox write *is* the durable record; the
+        # daemon's inbox processor will re-confirm via its own ``mark_processed``.
+        idx: MetadataIndex | None = state["index"]
+        if idx is not None:
+            try:
+                idx.insert(
+                    message_id,
+                    state=MessageState.ACKED,
+                    type=envelope.get("type") if isinstance(envelope, dict) else None,
+                    remote=config.node_name,
+                    capability=(
+                        envelope.get("capability") if isinstance(envelope, dict) else None
+                    ),
+                    remote_task_id=(
+                        str(envelope.get("remote_task_id") or "")
+                        or None
+                    ) if isinstance(envelope, dict) else None,
+                    schema_hash=(
+                        envelope.get("schema_hash") if isinstance(envelope, dict) else None
+                    ),
+                    size=len(payload_bytes),
+                )
+                idx.mark_processed(message_id)
+            except Exception as exc:  # noqa: BLE001 — index must not break the listener
+                log.warning("index insert (inbox) failed for %s: %s", message_id, exc)
         emit_event(
             "MESSAGE_ACKED",
             message_id=message_id,

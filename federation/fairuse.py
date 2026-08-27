@@ -32,7 +32,10 @@ import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from federation.index import MetadataIndex
 
 log = logging.getLogger("federation.fairuse")
 
@@ -112,6 +115,8 @@ class FairUse:
         max_daily: int = DEFAULT_MAX_DAILY,
         state_dir: Path | str | None = None,
         clock: "Any" = None,
+        index: "MetadataIndex | None" = None,
+        remote: str | None = None,
     ) -> None:
         if not capability:
             raise ValueError("capability must be non-empty")
@@ -140,6 +145,14 @@ class FairUse:
         # Load today's persisted counter (if any) so a restart continues
         # the day's budget rather than resetting it.
         self._daily_count = self._load_daily(self._daily_key)
+        # T-103: optional SQLite index backing for the daily counter. When
+        # wired, ``check_daily``/``claim`` consult the durable
+        # ``count_today`` from the index instead of the per-day file — a
+        # crash mid-day does not lose the budget, and the count covers
+        # every forwarded message across daemon restarts. ``remote`` scopes
+        # the count to one peer (the index is per-remote by default).
+        self._index = index
+        self._remote = remote
 
     # ------------------------------------------------------------------ #
     # Persistence helpers
@@ -182,6 +195,27 @@ class FairUse:
             self._daily_key = key
             self._daily_count = self._load_daily(key)
 
+    def _today_count(self) -> int:
+        """Return today's forward count for this capability.
+
+        T-103: when an index is wired, the durable ``count_today`` from the
+        index supersedes the in-memory/file counter (it counts every
+        indexed message created today, surviving restarts and counting
+        across threads). Falls back to the in-memory counter on error or
+        when no index is configured. Called under ``self._lock``.
+        """
+        if self._index is not None:
+            try:
+                return self._index.count_today(
+                    remote=self._remote, capability=self.capability
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "index count_today failed for %s: %s — using in-memory",
+                    self.capability, exc,
+                )
+        return self._daily_count
+
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
@@ -189,13 +223,14 @@ class FairUse:
     def check_daily(self) -> bool:
         """Return ``True`` if the daily cap is not yet exhausted.
 
-        ``max_daily == 0`` means unbounded.
+        ``max_daily == 0`` means unbounded. T-103: when an index is wired
+        the count is read from the durable SQLite index.
         """
         with self._lock:
             self._rollover_if_needed()
             if self.max_daily == 0:
                 return True
-            return self._daily_count < self.max_daily
+            return self._today_count() < self.max_daily
 
     def can_claim(self) -> bool:
         """Return ``True`` iff a new claim fits both the parallel and daily caps.
@@ -205,7 +240,7 @@ class FairUse:
         """
         with self._lock:
             self._rollover_if_needed()
-            if self.max_daily != 0 and self._daily_count >= self.max_daily:
+            if self.max_daily != 0 and self._today_count() >= self.max_daily:
                 return False
             if self.max_parallel != 0 and self._in_flight >= self.max_parallel:
                 return False
@@ -221,11 +256,17 @@ class FairUse:
         Idempotency: this is *not* idempotent — each successful ``claim()``
         consumes one daily + one parallel slot. Pair with exactly one
         ``release()`` when the forward completes (or the stage is abandoned).
+
+        T-103: when an index is wired the daily check uses the durable
+        ``count_today``; the in-memory file counter is still incremented so
+        a non-index ``check_daily`` path stays consistent if the index is
+        later removed.
         """
         with self._lock:
             self._rollover_if_needed()
             reason: str | None = None
-            if self.max_daily != 0 and self._daily_count >= self.max_daily:
+            today = self._today_count() if self.max_daily != 0 else 0
+            if self.max_daily != 0 and today >= self.max_daily:
                 reason = "daily"
             elif self.max_parallel != 0 and self._in_flight >= self.max_parallel:
                 reason = "parallel"
@@ -233,7 +274,7 @@ class FairUse:
                 log.info(
                     "FAIRUSE_REJECTED capability=%s reason=%s in_flight=%d "
                     "daily_count=%d max_parallel=%d max_daily=%d",
-                    self.capability, reason, self._in_flight, self._daily_count,
+                    self.capability, reason, self._in_flight, today,
                     self.max_parallel, self.max_daily,
                 )
                 return False
@@ -277,7 +318,7 @@ class FairUse:
     def daily_count(self) -> int:
         with self._lock:
             self._rollover_if_needed()
-            return self._daily_count
+            return self._today_count() if self._index is not None else self._daily_count
 
     @property
     def daily_key(self) -> str:
@@ -307,6 +348,8 @@ class FairUseRegistry:
         default_max_daily: int = DEFAULT_MAX_DAILY,
         enforce: bool = False,
         clock: "Any" = None,
+        index: "MetadataIndex | None" = None,
+        remote: str | None = None,
     ) -> None:
         self._policies: dict[str, FairUse] = dict(policies) if policies else {}
         self.state_dir = state_dir
@@ -314,6 +357,9 @@ class FairUseRegistry:
         self.default_max_daily = default_max_daily
         self.enforce = enforce
         self._clock = clock
+        # T-103: index + remote scope passed to lazily-created policies.
+        self._index = index
+        self._remote = remote
         self._lock = threading.Lock()
 
     def for_cap(self, capability: str) -> FairUse | None:
@@ -334,6 +380,8 @@ class FairUseRegistry:
                     max_daily=self.default_max_daily,
                     state_dir=self.state_dir,
                     clock=self._clock,
+                    index=self._index,
+                    remote=self._remote,
                 )
                 self._policies[capability] = pol
             return pol

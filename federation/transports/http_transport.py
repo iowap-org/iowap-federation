@@ -43,6 +43,7 @@ from federation.ack import (
 )
 from federation.crypto import Crypto
 from federation.envelope import seal as envelope_seal
+from federation.index import MetadataIndex
 from federation.lifecycle import (
     LifecycleRegistry,
     MessageState,
@@ -84,6 +85,10 @@ class HttpTransport(Transport):
         # Lifecycle (T-102). Optional registry + retry policy.
         self.registry: LifecycleRegistry | None = None
         self.retry_policy: RetryPolicy = RetryPolicy()
+        # T-103 metadata index. When wired (by the daemon), the transport
+        # mirrors state transitions into it on every ACK outcome. Optional
+        # — the transport works without it (pre-T-103 behaviour).
+        self.index: "MetadataIndex | None" = None
         # SenderACK ledger is created lazily per sync_outbox call (needs
         # the outbox/ + archive/ dirs). Kept on the instance for status.
         self.sender_ack: SenderAck | None = None
@@ -167,9 +172,13 @@ class HttpTransport(Transport):
         )
         self.sender_ack = sender_ack
 
+        # Collect outbox files, recursing into hash-partition subdirs (T-103).
+        outbox_files = sorted(
+            f for f in outbox_dir.rglob("*.json") if f.is_file()
+        )
         accepted: list[str] = []
-        for f in sorted(outbox_dir.iterdir()):
-            if not f.is_file() or f.name.startswith("."):
+        for f in outbox_files:
+            if f.name.startswith("."):
                 continue
             try:
                 payload = json.loads(f.read_text())
@@ -206,6 +215,7 @@ class HttpTransport(Transport):
                 status = sender_ack.handle_inbox_response(
                     message_id, ack_body, outbox_file=f
                 )
+                self._mirror_index_state(message_id, status)
                 if status == ACK_STATUS_ACCEPTED:
                     accepted.append(message_id)
                     self._post_ack_back(message_id, status)
@@ -225,6 +235,7 @@ class HttpTransport(Transport):
                     {"status": ACK_STATUS_REJECTED, "message_id": message_id},
                     outbox_file=f,
                 )
+                self._mirror_index_state(message_id, ACK_STATUS_REJECTED)
                 self._post_ack_back(message_id, ACK_STATUS_REJECTED)
             else:
                 log.warning(
@@ -236,25 +247,75 @@ class HttpTransport(Transport):
                 self._record_failure(message_id, f"http={resp.status_code}")
         return accepted
 
+    def _mirror_index_state(self, message_id: str, ack_status: str) -> None:
+        """T-103: mirror the sender's view of the state into the index.
+
+        Maps the ACK outcome to a lifecycle state and updates the index row
+        (if a transport has one wired). The mapping mirrors
+        :meth:`SenderAck._advance_lifecycle` so the index stays in lock-step
+        with the in-memory registry. Best-effort — a failure here is logged
+        but never raised.
+        """
+        if self.index is None:
+            return
+        if ack_status == ACK_STATUS_ACCEPTED:
+            target = MessageState.ARCHIVED
+        elif ack_status == ACK_STATUS_REJECTED:
+            target = MessageState.REJECTED
+        else:
+            return  # failed/unknown handled by _record_failure retry path
+        try:
+            self.index.update_state(message_id, target)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("index mirror %s → %s failed: %s", message_id, target, exc)
+
     def _record_failure(self, message_id: str, reason: str) -> None:
-        """Record a send failure; advance retry counter via the registry."""
-        if self.registry is None:
-            return
-        lc = self.registry.get(message_id)
-        if lc is None:
-            return
-        # Only count retries for messages we're tracking and that are in a
-        # retryable state.
-        if lc.state in (MessageState.QUEUED, MessageState.SENT, MessageState.PENDING_REMOTE_RESPONSE):
-            delay = lc.record_retry(self.retry_policy)
-            if delay < 0:
-                # Exhausted — record_retry already moved it to FAILED.
-                log.warning("message %s exhausted retries: %s", message_id, reason)
-            else:
-                log.info(
-                    "message %s will retry in %.1fs (reason=%s)",
-                    message_id, delay, reason,
-                )
+        """Record a send failure; advance retry counter via the registry.
+
+        T-103: the retry increment + FAILED mirror are also written to the
+        index (best-effort), independent of the in-memory registry so the
+        index stays consistent even when the transport has no registry
+        wired (e.g. a transport used standalone).
+        """
+        # T-103: mirror the retry increment into the index.
+        new_count = -1
+        if self.index is not None:
+            try:
+                new_count = self.index.increment_retry(message_id)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("index increment_retry %s failed: %s", message_id, exc)
+
+        # In-memory registry path (advance the Lifecycle).
+        if self.registry is not None:
+            lc = self.registry.get(message_id)
+            if lc is not None and lc.state in (
+                MessageState.QUEUED, MessageState.SENT, MessageState.PENDING_REMOTE_RESPONSE
+            ):
+                delay = lc.record_retry(self.retry_policy)
+                if delay < 0:
+                    log.warning("message %s exhausted retries: %s", message_id, reason)
+                else:
+                    log.info(
+                        "message %s will retry in %.1fs (reason=%s)",
+                        message_id, delay, reason,
+                    )
+
+        # T-103: mirror FAILED into the index when retries are exhausted,
+        # independent of the registry. We detect exhaustion by either the
+        # in-memory record_retry returning -1 OR the index retry_count
+        # reaching the policy's max_attempts.
+        exhausted = False
+        if self.registry is not None:
+            lc = self.registry.get(message_id)
+            if lc is not None and lc.state is MessageState.FAILED:
+                exhausted = True
+        if not exhausted and new_count >= 0 and new_count + 1 >= self.retry_policy.max_attempts:
+            exhausted = True
+        if exhausted and self.index is not None:
+            try:
+                self.index.update_state(message_id, MessageState.FAILED)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("index FAILED mirror %s: %s", message_id, exc)
 
     def _post_ack_back(self, message_id: str, status: str) -> None:
         """POST /fed/v1/ack to the receiver so it can free state.
