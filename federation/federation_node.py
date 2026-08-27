@@ -28,6 +28,12 @@ Plaintext envelopes for now (E2EE arrives in T-101). In-memory reply
 correlation (``_forwarded_stages``) — SQLite persistence lands in T-103.
 Replay dedupe (``_processed_messages``) is an in-memory set for T-096; the
 TTL-pruned cache is T-102.
+
+Fair-Use enforcement (T-099) is optional: the daemon accepts a
+``FairUseRegistry``. When the registry is ``enforce=False`` (the default)
+no claim is gated. When enforced, ``_claim_and_forward`` reserves a
+parallel+daily slot on a successful claim and ``_process_inbox_file``
+releases the parallel slot when the reply completes the stage.
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from federation.config import NodeConfig, Peer, load_node_config
+from federation.fairuse import FairUse, FairUseRegistry
 from federation.paths import (
     BASE_DIR,
     ensure_federation_dirs,
@@ -187,6 +194,7 @@ class FederationDaemon:
         transport_factory: TransportFactory | None = None,
         base_dir: Path | None = None,
         intervals: dict[str, float] | None = None,
+        fairuse_registry: FairUseRegistry | None = None,
     ) -> None:
         self.client = client
         self.cfg = cfg
@@ -197,6 +205,13 @@ class FederationDaemon:
         self.forward_caps = list(forward_caps) if forward_caps else []
         self.transport_factory = transport_factory
         self.base_dir = Path(base_dir) if base_dir else federation_root()
+
+        # Fair-Use enforcement (T-099). Optional: when ``None`` (or when a
+        # registry is present but ``enforce=False``) the daemon never blocks
+        # a claim. When enforced, ``_claim_and_forward`` asks the policy
+        # before calling ``client.claim`` and releases the parallel slot
+        # when the reply completes (or the stage is abandoned).
+        self.fairuse = fairuse_registry or FairUseRegistry(enforce=False)
 
         iv = intervals or {}
         self.heartbeat_interval = iv.get("heartbeat", HEARTBEAT_INTERVAL)
@@ -318,8 +333,18 @@ class FederationDaemon:
 
         Pure-ish (only touches the relay client + filesystem); safe to call
         from a test without threads. On a 204 (``claim`` returns ``None``) it
-        is a no-op.
+        is a no-op. When a fair-use policy is enforced for ``capability`` and
+        the parallel/daily cap is exhausted, the claim is skipped entirely
+        (no ``client.claim`` call) so the stage stays available for a peer.
         """
+        # Fair-use gate (T-099): skip claiming while the cap is exhausted.
+        policy = self.fairuse.for_cap(capability)
+        if policy is not None and not policy.can_claim():
+            log.info(
+                "FAIRUSE_SKIP capability=%s — parallel/daily cap exhausted",
+                capability,
+            )
+            return
         try:
             stage = self.client.claim(capability)
         except Exception as exc:  # noqa: BLE001 — never crash the claim loop
@@ -327,12 +352,26 @@ class FederationDaemon:
             return
         if stage is None:
             return
+        # Reserve the fair-use slot only after a successful claim. If the
+        # reservation fails (e.g. raced between can_claim and claim), release
+        # the stage by leaving it claimed-but-unforwarded and do not consume
+        # a slot. This is conservative — a re-run will re-claim later.
+        if policy is not None and not policy.claim():
+            log.warning(
+                "FAIRUSE_RACE capability=%s — stage claimed but slot denied; "
+                "leaving stage claimed (will be retried by scheduler)",
+                capability,
+            )
+            return
         peer = self._peer_for_stage(stage)
         if peer is None:
             log.warning(
                 "claimed stage %s for %s but no routable peer — leaving claimed",
                 stage.get("stage_id"), capability,
             )
+            # We consumed a fair-use slot for nothing — release it.
+            if policy is not None:
+                policy.release()
             return
         message_id = self._write_forward_file(peer, stage)
         if message_id is not None:
@@ -341,6 +380,10 @@ class FederationDaemon:
                 "forwarded stage %s → peer %s (message_id=%s)",
                 stage.get("stage_id"), peer.id, message_id,
             )
+        else:
+            # Forward failed (unroutable mid-write) — release the slot.
+            if policy is not None:
+                policy.release()
 
     def _process_inbox_file(self, peer: Peer, path: Path) -> str | None:
         """Process a single inbox file. Returns the action taken or ``None``.
@@ -433,6 +476,11 @@ class FederationDaemon:
                             "MESSAGE_COMPLETED message_id=%s stage=%s task=%s",
                             message_id, remote_task_id, task_id,
                         )
+                        # Fair-use release (T-099): the forwarded task is
+                        # done — free its parallel slot.
+                        rel_policy = self.fairuse.for_cap(capability)
+                        if rel_policy is not None:
+                            rel_policy.release()
                         action = "completed"
                     except Exception as exc:  # noqa: BLE001
                         # Put it back so a later retry can complete.

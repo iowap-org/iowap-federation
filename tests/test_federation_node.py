@@ -715,3 +715,133 @@ def test_main_relay_client_init_failure_returns_error(monkeypatch, tmp_path):
     assert rc_out == 1
     # ensure we did not start a daemon (no threads spawned): just assert rc.
     _ = mod  # silence unused import linter
+
+
+# --------------------------------------------------------------------- #
+# Fair-Use integration (T-099)
+# --------------------------------------------------------------------- #
+
+def test_fairuse_not_enforced_by_default(fake_client, fed_config, isolated_fs):
+    """No registry → no gating; all claims succeed (regression guard)."""
+    fake_client._claims = [
+        {"stage_id": f"st-{i}", "task_id": f"tk-{i}", "capability": "image.gen",
+         "payload": {"prompt": "cat"}}
+        for i in range(5)
+    ]
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    for _ in range(5):
+        d._claim_and_forward("image.gen")
+    assert len(fake_client.claim_calls) == 5
+    assert d.tasks_forwarded == 5
+
+
+def test_fairuse_blocks_claim_when_parallel_exhausted(
+    fake_client, fed_config, isolated_fs
+):
+    """When parallel cap is reached, claim is not even attempted."""
+    from federation.fairuse import FairUse, FairUseRegistry
+
+    pol = FairUse(
+        "image.gen", max_parallel=1, max_daily=50, state_dir=isolated_fs,
+    )
+    reg = FairUseRegistry(enforce=True, policies={"image.gen": pol})
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    d.fairuse = reg
+
+    # First claim succeeds.
+    fake_client._claims = [
+        {"stage_id": "st-1", "task_id": "tk-1", "capability": "image.gen",
+         "payload": {}}
+    ]
+    d._claim_and_forward("image.gen")
+    assert d.tasks_forwarded == 1
+    assert pol.in_flight == 1
+
+    # Second claim must be gated (no client.claim call).
+    fake_client._claims = [
+        {"stage_id": "st-2", "task_id": "tk-2", "capability": "image.gen",
+         "payload": {}}
+    ]
+    d._claim_and_forward("image.gen")
+    assert fake_client.claim_calls == ["image.gen"]   # only the first
+    assert d.tasks_forwarded == 1
+    assert pol.in_flight == 1
+
+
+def test_fairuse_releases_slot_on_reply_completion(
+    fake_client, fed_config, isolated_fs, peer
+):
+    """Reply completing a stage frees the parallel slot for a new claim."""
+    from federation.fairuse import FairUse, FairUseRegistry
+
+    pol = FairUse(
+        "image.gen", max_parallel=1, max_daily=50, state_dir=isolated_fs,
+    )
+    reg = FairUseRegistry(enforce=True, policies={"image.gen": pol})
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    d.fairuse = reg
+
+    # Forward a stage.
+    fake_client._claims = [
+        {"stage_id": "st-1", "task_id": "tk-1", "capability": "image.gen",
+         "payload": {"prompt": "cat"}}
+    ]
+    d._claim_and_forward("image.gen")
+    assert pol.in_flight == 1
+
+    # Deliver the reply → inbox.
+    reply = {
+        "message_id": "m-reply-1",
+        "type": "result",
+        "direction": "reply",
+        "capability": "image.gen",
+        "remote_task_id": "st-1",
+        "payload": {"image": "data"},
+    }
+    path = _write_inbox(peer.id, isolated_fs, reply)
+    d._process_inbox(peer)
+    assert d.stages_completed == 1
+    # Slot freed.
+    assert pol.in_flight == 0
+
+    # Now a new claim fits.
+    fake_client._claims = [
+        {"stage_id": "st-2", "task_id": "tk-2", "capability": "image.gen",
+         "payload": {}}
+    ]
+    d._claim_and_forward("image.gen")
+    assert d.tasks_forwarded == 2
+    assert pol.in_flight == 1
+    _ = path  # file is consumed by _process_inbox
+
+
+def test_fairuse_daily_cap_blocks_after_n(
+    fake_client, fed_config, isolated_fs
+):
+    """Daily cap blocks new claims after N forwards even with parallel room."""
+    from federation.fairuse import FairUse, FairUseRegistry
+
+    pol = FairUse(
+        "image.gen", max_parallel=50, max_daily=2, state_dir=isolated_fs,
+    )
+    reg = FairUseRegistry(enforce=True, policies={"image.gen": pol})
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    d.fairuse = reg
+
+    for i in range(2):
+        fake_client._claims = [
+            {"stage_id": f"st-{i}", "task_id": f"tk-{i}", "capability": "image.gen",
+             "payload": {}}
+        ]
+        d._claim_and_forward("image.gen")
+    assert d.tasks_forwarded == 2
+    assert pol.daily_count == 2
+
+    # 3rd claim gated by daily cap.
+    fake_client._claims = [
+        {"stage_id": "st-3", "task_id": "tk-3", "capability": "image.gen",
+         "payload": {}}
+    ]
+    d._claim_and_forward("image.gen")
+    assert d.tasks_forwarded == 2
+    assert fake_client.claim_calls == ["image.gen", "image.gen"]  # only 2
