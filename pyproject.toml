@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "IOWAP Federation Node — bridge capabilities between relays"
 requires-python = ">=3.11"
 
+[project.scripts]
+federation-daemon = "federation.federation_node:main"
+
 [tool.setuptools]
 packages = ["federation", "federation.transports"]
 
