@@ -1,5 +1,6 @@
 import pytest
-from federation.transport import Transport
+from federation.transport import Transport, create_transport
+from federation.transports.http_transport import HttpTransport
 
 
 def test_transport_is_abstract():
@@ -22,3 +23,22 @@ def test_transport_methods_raise_not_implemented():
         t.discover_capabilities()
     # close() is a no-op by default, not NotImplementedError
     assert t.close() is None
+
+def test_create_transport_http():
+    t = create_transport({"federation": {"transport_type": "http"}})
+    assert isinstance(t, HttpTransport)
+
+
+def test_create_transport_default_is_http():
+    t = create_transport({})
+    assert isinstance(t, HttpTransport)
+
+
+def test_create_transport_unknown_raises():
+    with pytest.raises(ValueError, match="Unknown transport_type"):
+        create_transport({"federation": {"transport_type": "quic"}})
+
+
+def test_create_transport_email_not_implemented():
+    with pytest.raises(ValueError, match="not implemented"):
+        create_transport({"federation": {"transport_type": "email"}})
