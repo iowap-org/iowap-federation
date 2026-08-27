@@ -150,6 +150,102 @@ def test_inbox_two_messages_distinct_files(client, tmp_path):
 
 
 # --------------------------------------------------------------------- #
+# Replay guard (T-102)
+# --------------------------------------------------------------------- #
+def test_inbox_rejects_duplicate_with_409_and_inline_rejected_ack(client, tmp_path):
+    envelope = {"message_id": "dup-1", "type": "task", "payload": {"x": 1}}
+    r1 = client.post("/fed/v1/inbox", json=envelope, headers=auth_headers())
+    assert r1.status_code == 202
+    r2 = client.post("/fed/v1/inbox", json=envelope, headers=auth_headers())
+    assert r2.status_code == 409
+    body = r2.json()
+    assert body["status"] == "rejected"
+    assert body["message_id"] == "dup-1"
+    # Only one file on disk despite the second POST.
+    files = sorted((tmp_path / "inbox").iterdir())
+    assert [p.name for p in files] == ["dup-1.json"]
+
+
+# --------------------------------------------------------------------- #
+# E2EE inbox (T-101 + T-102 wiring)
+# --------------------------------------------------------------------- #
+def test_inbox_decrypts_ciphertext_envelope_when_crypto_configured(tmp_path):
+    from federation.crypto import Crypto, generate_keypair
+    from federation.envelope import build_plaintext_envelope, seal
+    from federation.config import NodeConfig, Peer
+
+    a_pk, a_sk = generate_keypair()  # sender (fed-b)
+    b_pk, b_sk = generate_keypair()  # receiver (fed-a, this listener)
+    # Sender's crypto: sender_sk + receiver_pk
+    sender_crypto = Crypto(a_sk, b_pk)
+    # Receiver's crypto: receiver_sk + sender_pk
+    receiver_crypto = Crypto(b_sk, a_pk)
+
+    cfg = NodeConfig(
+        node_name="fed-a",
+        peers=[Peer(id="fed-b", endpoint="https://fed-b:8791", token="fed_t_secret")],
+        offer=[{"capability": "image.gen", "name": "image.gen@fed-a"}],
+    )
+    app = create_listener_app(
+        cfg,
+        inbox_dir=tmp_path / "inbox",
+        crypto=receiver_crypto,
+    )
+    c = TestClient(app)
+
+    plaintext = build_plaintext_envelope(
+        type="task",
+        direction="forward",
+        capability="image.gen@fed-b",
+        payload={"prompt": "hi"},
+        message_id="enc-1",
+    )
+    ciphertext_env = seal(sender_crypto, plaintext, message_id="enc-1")
+    r = c.post("/fed/v1/inbox", json=ciphertext_env, headers=auth_headers())
+    assert r.status_code == 202
+    assert r.json() == {"status": "accepted", "message_id": "enc-1"}
+    written = tmp_path / "inbox" / "enc-1.json"
+    assert written.exists()
+    decoded = json.loads(written.read_text())
+    # The plaintext envelope (not the ciphertext) is on disk.
+    assert decoded["message_id"] == "enc-1"
+    assert decoded["payload"] == {"prompt": "hi"}
+    assert "ciphertext" not in decoded
+
+
+def test_inbox_rejects_tampered_ciphertext_with_400(tmp_path):
+    from federation.crypto import Crypto, generate_keypair
+    from federation.envelope import build_plaintext_envelope, seal
+
+    a_pk, a_sk = generate_keypair()
+    b_pk, b_sk = generate_keypair()
+    sender_crypto = Crypto(a_sk, b_pk)
+    receiver_crypto = Crypto(b_sk, a_pk)
+
+    cfg = NodeConfig(
+        node_name="fed-a",
+        peers=[Peer(id="fed-b", endpoint="https://x", token="fed_t_secret")],
+    )
+    app = create_listener_app(cfg, inbox_dir=tmp_path / "inbox", crypto=receiver_crypto)
+    c = TestClient(app)
+
+    plaintext = build_plaintext_envelope(
+        type="task", direction="forward", capability="cap", payload={},
+        message_id="tamper-1",
+    )
+    env = seal(sender_crypto, plaintext, message_id="tamper-1")
+    # Flip one byte in the ciphertext (base64) — breaks the Poly1305 tag.
+    ct = bytearray(env["ciphertext"].encode("ascii"))
+    ct[-1] = (ct[-1] + 1) % 256
+    env["ciphertext"] = ct.decode("ascii")
+    r = c.post("/fed/v1/inbox", json=env, headers=auth_headers())
+    assert r.status_code == 400
+    assert "decrypt" in r.json()["detail"]
+    # Nothing on disk.
+    assert not (tmp_path / "inbox" / "tamper-1.json").exists()
+
+
+# --------------------------------------------------------------------- #
 # GET /fed/v1/discover
 # --------------------------------------------------------------------- #
 def test_discover_returns_offer(client):
@@ -172,20 +268,49 @@ def test_discover_empty_when_no_offer(tmp_path):
 
 
 # --------------------------------------------------------------------- #
-# 501 endpoints (T-102)
+# /fed/v1/ack (T-102) + /fed/v1/results (still 501)
 # --------------------------------------------------------------------- #
 def test_results_returns_501(client):
     r = client.get("/fed/v1/results/some-id", headers=auth_headers())
     assert r.status_code == 501
 
 
-def test_ack_returns_501(client):
+def test_ack_rejects_invalid_status(client):
     r = client.post(
         "/fed/v1/ack",
         json={"message_id": "x", "status": "ok"},
         headers=auth_headers(),
     )
-    assert r.status_code == 501
+    assert r.status_code == 400
+
+
+def test_ack_records_accepted_status(client):
+    r = client.post(
+        "/fed/v1/ack",
+        json={"message_id": "mid-1", "status": "accepted"},
+        headers=auth_headers(),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"status": "ok", "message_id": "mid-1", "ack": "accepted"}
+
+
+def test_ack_rejects_missing_message_id(client):
+    r = client.post(
+        "/fed/v1/ack",
+        json={"status": "accepted"},
+        headers=auth_headers(),
+    )
+    assert r.status_code == 400
+
+
+def test_ack_rejects_non_object_body(client):
+    r = client.post(
+        "/fed/v1/ack",
+        content=b"[1,2,3]",
+        headers=auth_headers(),
+    )
+    assert r.status_code == 400
 
 
 def test_results_requires_auth(client):

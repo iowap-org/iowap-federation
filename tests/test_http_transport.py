@@ -134,8 +134,11 @@ def test_sync_outbox_sends_each_file_returns_ids(tmp_path):
         )
     sent = t.sync_outbox(outbox)
     assert sorted(sent) == ["mid-0", "mid-1", "mid-2"]
-    # files remain (T-102 removes on ACK; T-095 only returns sent ids)
-    assert len(list(outbox.iterdir())) == 3
+    # T-102: accepted ACKs move the outbox file to archive/.
+    assert len(list(outbox.iterdir())) == 0
+    archive = tmp_path / "archive"
+    archived = sorted(p.name for p in archive.iterdir())
+    assert archived == ["mid-0.json", "mid-1.json", "mid-2.json"]
     t.close()
 
 
@@ -273,4 +276,156 @@ def test_close_releases_client():
     t.close()
     assert t._client is None
     # close is idempotent
+    t.close()
+
+
+# --------------------------------------------------------------------- #
+# T-102: ACK-driven archival, E2EE sealing, replay rejection, retry
+# --------------------------------------------------------------------- #
+def test_sync_outbox_seals_ciphertext_when_crypto_set(tmp_path):
+    """When crypto is configured, the wire body is a ciphertext envelope."""
+    from federation.crypto import Crypto, generate_keypair
+    from federation.envelope import build_plaintext_envelope
+
+    a_pk, a_sk = generate_keypair()
+    b_pk, b_sk = generate_keypair()
+    sender_crypto = Crypto(a_sk, b_pk)
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("Authorization") != f"Bearer {TOKEN}":
+            return httpx.Response(401)
+        if request.method == "GET" and request.url.path == "/fed/v1/discover":
+            return httpx.Response(200, json=[{"capability": "image.gen"}])
+        if request.method == "POST" and request.url.path == "/fed/v1/inbox":
+            body = json.loads(request.content)
+            captured["body"] = body
+            return httpx.Response(
+                202, json={"status": "accepted", "message_id": body["message_id"]}
+            )
+        if request.method == "POST" and request.url.path == "/fed/v1/ack":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    t = make_transport(handler)
+    t.crypto = sender_crypto
+    t.connect(URL, TOKEN)
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    plaintext = build_plaintext_envelope(
+        type="task", direction="forward", capability="cap", payload={"x": 1},
+        message_id="enc-msg",
+    )
+    (outbox / "enc-msg.json").write_text(json.dumps(plaintext))
+    sent = t.sync_outbox(outbox)
+    assert sent == ["enc-msg"]
+    # The wire body was the ciphertext envelope, not the plaintext.
+    assert "ciphertext" in captured["body"]
+    assert "nonce" in captured["body"]
+    assert captured["body"]["message_id"] == "enc-msg"
+    # File archived on accepted ACK.
+    assert not (outbox / "enc-msg.json").exists()
+    t.close()
+
+
+def test_sync_outbox_archives_on_rejected_ack(tmp_path):
+    """A rejected inline ACK archives the file (terminal)."""
+    def handler(request):
+        if request.headers.get("Authorization") != f"Bearer {TOKEN}":
+            return httpx.Response(401)
+        if request.method == "GET" and request.url.path == "/fed/v1/discover":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path == "/fed/v1/inbox":
+            body = json.loads(request.content)
+            return httpx.Response(
+                202, json={"status": "rejected", "message_id": body["message_id"]}
+            )
+        return httpx.Response(404)
+
+    t = make_transport(handler)
+    t.connect(URL, TOKEN)
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    (outbox / "rej.json").write_text(json.dumps({"message_id": "rej"}))
+    sent = t.sync_outbox(outbox)
+    # Rejected ACKs are not in the accepted list.
+    assert sent == []
+    # File archived (terminal).
+    archive = tmp_path / "archive"
+    assert (archive / "rej.json").exists()
+    t.close()
+
+
+def test_sync_outbox_replay_409_archives_file(tmp_path):
+    """A 409 replay response archives the file so we don't loop forever."""
+    def handler(request):
+        if request.headers.get("Authorization") != f"Bearer {TOKEN}":
+            return httpx.Response(401)
+        if request.method == "GET" and request.url.path == "/fed/v1/discover":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path == "/fed/v1/inbox":
+            return httpx.Response(409, json={"status": "rejected", "message_id": "dup"})
+        return httpx.Response(404)
+
+    t = make_transport(handler)
+    t.connect(URL, TOKEN)
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    (outbox / "dup.json").write_text(json.dumps({"message_id": "dup"}))
+    sent = t.sync_outbox(outbox)
+    assert sent == []
+    assert not (outbox / "dup.json").exists()
+    assert (tmp_path / "archive" / "dup.json").exists()
+    t.close()
+
+
+def test_sync_outbox_non_202_leaves_file_for_retry(tmp_path):
+    """A non-202/non-409 response leaves the file in outbox for retry."""
+    def handler(request):
+        if request.headers.get("Authorization") != f"Bearer {TOKEN}":
+            return httpx.Response(401)
+        if request.method == "GET" and request.url.path == "/fed/v1/discover":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path == "/fed/v1/inbox":
+            return httpx.Response(503, json={"detail": "down"})
+        return httpx.Response(404)
+
+    t = make_transport(handler)
+    t.connect(URL, TOKEN)
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    (outbox / "retry.json").write_text(json.dumps({"message_id": "retry"}))
+    sent = t.sync_outbox(outbox)
+    assert sent == []
+    # File remains for retry.
+    assert (outbox / "retry.json").exists()
+    t.close()
+
+
+def test_sync_outbox_post_ack_back_to_receiver(tmp_path):
+    """An accepted ACK triggers a POST /fed/v1/ack back to the receiver."""
+    seen_ack = []
+    def handler(request):
+        if request.headers.get("Authorization") != f"Bearer {TOKEN}":
+            return httpx.Response(401)
+        if request.method == "GET" and request.url.path == "/fed/v1/discover":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path == "/fed/v1/inbox":
+            body = json.loads(request.content)
+            return httpx.Response(
+                202, json={"status": "accepted", "message_id": body["message_id"]}
+            )
+        if request.method == "POST" and request.url.path == "/fed/v1/ack":
+            seen_ack.append(json.loads(request.content))
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    t = make_transport(handler)
+    t.connect(URL, TOKEN)
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    (outbox / "ack.json").write_text(json.dumps({"message_id": "ack"}))
+    t.sync_outbox(outbox)
+    assert seen_ack == [{"message_id": "ack", "status": "accepted"}]
     t.close()

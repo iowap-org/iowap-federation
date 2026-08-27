@@ -1,18 +1,31 @@
-"""FedNode P2P HTTP listener (T-095).
+"""FedNode P2P HTTP listener (T-095 / T-101 / T-102).
 
 Serves the Peer-to-Peer API described in the master plan:
 
-| Endpoint                  | Method | T-095 behaviour                         |
+| Endpoint                  | Method | Behaviour                              |
 |---------------------------|--------|----------------------------------------|
-| ``/fed/v1/inbox``         | POST   | validate bearer, write body to inbox/, 202 |
+| ``/fed/v1/inbox``         | POST   | validate bearer, replay-check, decrypt (T-101), write to inbox/, 202 + inline ACK |
 | ``/fed/v1/discover``      | GET    | return capability offer from node.yaml  |
-| ``/fed/v1/results/{id}``  | GET    | 501 (T-102)                            |
-| ``/fed/v1/ack``           | POST   | 501 (T-102)                            |
+| ``/fed/v1/results/{id}``  | GET    | 501 (full result polling is the daemon's job) |
+| ``/fed/v1/ack``           | POST   | record sender's ACK, free state (T-102) |
 
 Auth: every request carries ``Authorization: Bearer fed_t_<token>``. The
 listener validates it against the set of tokens configured for the node's
 peers (any configured peer may talk to us) — or against an explicit
 ``listener_token`` override.
+
+E2EE (T-101): when a :class:`federation.crypto.Crypto` is supplied via
+``crypto=`` (one per accepted sender fingerprint), incoming inbox bodies
+are ciphertext envelopes that are decrypted *after* the cheap structural
+checks and *before* the inbox write. Plaintext JSON is still accepted
+(crypto-less mode) so the pre-T-101 tests keep passing.
+
+Lifecycle (T-102): every accepted inbox POST runs through a
+:class:`federation.lifecycle.ReplayGuard` — a duplicate ``message_id`` is
+rejected with ``409`` + an inline ``rejected`` ACK *before* the inbox
+write. ``POST /fed/v1/ack`` records the sender's confirmation that it
+received our inline ACK (so we can free state). Writes are atomic
+(``.tmp_<id>`` + ``os.replace``).
 
 The listener is symmetric: both ends serve the same API. The remote
 FedNode re-submits the task as a normal task into its own relay — that step
@@ -27,15 +40,27 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
+from federation.ack import (
+    ACK_STATUS_ACCEPTED,
+    ReceiverAck,
+    inbox_accepted,
+    inbox_rejected,
+    parse_ack_body,
+)
 from federation.config import NodeConfig, load_node_config
+from federation.crypto import Crypto, CryptoError, SizeGuard
+from federation.envelope import open as envelope_open
+from federation.lifecycle import (
+    ReplayGuard,
+    atomic_write_bytes,
+    emit_event,
+)
 from federation.paths import ensure_federation_dirs, federation_root
 
 log = logging.getLogger("federation.listener")
@@ -53,34 +78,37 @@ def _bearer(authorization: str | None) -> str | None:
     return authorization.split(" ", 1)[1].strip() or None
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` atomically (tmp + ``os.replace``)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".tmp_{path.stem}_", dir=str(path.parent), suffix=".json"
-    )
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def create_listener_app(
     config: NodeConfig,
     *,
     inbox_dir: Path | None = None,
+    crypto: Crypto | None = None,
+    size_guard: SizeGuard | None = None,
+    replay_guard: ReplayGuard | None = None,
+    receiver_ack: ReceiverAck | None = None,
 ) -> FastAPI:
     """Build the FedNode listener FastAPI app.
 
     ``inbox_dir`` overrides the default inbox directory (used by tests with a
     tmp_path). Defaults to ``federation_root() / "_self" / "inbox"`` — the
     "_self" remote is this node's own inbox for incoming federated messages.
+
+    E2EE (T-101):
+    * ``crypto`` — a :class:`federation.crypto.Crypto` for the single
+      expected sender. When supplied, inbox bodies are treated as
+      ciphertext envelopes and decrypted after structural checks. When
+      ``None`` the listener accepts plaintext envelopes (pre-T-101 mode).
+    * ``size_guard`` — optional :class:`federation.crypto.SizeGuard` for
+      the cheap pre-decryption DoS checks. Defaults to a fresh guard.
+
+    Lifecycle (T-102):
+    * ``replay_guard`` — optional :class:`federation.lifecycle.ReplayGuard`.
+      Defaults to a fresh guard (1 h TTL). A duplicate ``message_id`` is
+      rejected with ``409`` and an inline ``rejected`` ACK before the
+      inbox write.
+    * ``receiver_ack`` — optional :class:`federation.ack.ReceiverAck`
+      ledger. Defaults to a fresh one. ``POST /fed/v1/ack`` records the
+      sender's confirmation here.
     """
     app = FastAPI(title="IOWAP FedNode", version="0.1.0")
 
@@ -90,12 +118,21 @@ def create_listener_app(
     inbox_dir = Path(inbox_dir)
     inbox_dir.mkdir(parents=True, exist_ok=True)
 
+    guard = size_guard or SizeGuard()
+    replay = replay_guard or ReplayGuard()
+    ack_ledger = receiver_ack or ReceiverAck()
+
     state: dict[str, Any] = {
         "config": config,
         "accepted_tokens": accepted,
         "inbox_dir": inbox_dir,
+        "crypto": crypto,
+        "size_guard": guard,
+        "replay_guard": replay,
+        "receiver_ack": ack_ledger,
         # Results the local relay has produced and exposed for polling.
-        # T-095: empty — populating this is the T-096 daemon's job.
+        # T-095/T-096: populating this is the daemon's job; the listener
+        # only needs to return them when present.
         "results": {},
     }
     app.state.fed = state
@@ -107,6 +144,54 @@ def create_listener_app(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="invalid or missing bearer token",
             )
+
+    def _extract_envelope(body: bytes) -> tuple[dict[str, Any], str]:
+        """Parse + (optionally) decrypt the inbox body.
+
+        Returns ``(plaintext_envelope, message_id)``. Raises
+        ``HTTPException`` (400/401-equivalent for crypto failures) on a
+        malformed or tampered body. The cheap structural checks run
+        *before* decryption (DoS guard).
+
+        When no crypto is configured the body is parsed as a plaintext
+        envelope (pre-T-101 path — both modes coexist so tests pass).
+        """
+        crypto_box: Crypto | None = state["crypto"]
+        try:
+            raw = json.loads(body)
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"invalid JSON: {e.msg}",
+            ) from e
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="envelope must be a JSON object",
+            )
+        # Heuristic: a ciphertext envelope carries ``ciphertext`` +
+        # ``nonce``; a plaintext envelope carries ``type``/``payload``.
+        if crypto_box is not None and "ciphertext" in raw and "nonce" in raw:
+            try:
+                inner, header = envelope_open(crypto_box, raw, size_guard=guard)
+            except CryptoError as e:
+                # Tamper / wrong key / bad size — surface as a 400 so the
+                # sender can move the message to REJECTED. Auth-bound
+                # (only an authenticated peer can reach here).
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"decrypt failed: {e}",
+                ) from e
+            emit_event("MESSAGE_DECRYPTED", message_id=header["message_id"])
+            return inner, header["message_id"]
+        # Plaintext path.
+        message_id = raw.get("message_id")
+        if not message_id or not isinstance(message_id, str):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="envelope.message_id is required",
+            )
+        return raw, message_id
 
     # ------------------------------------------------------------------ #
     # POST /fed/v1/inbox
@@ -120,32 +205,34 @@ def create_listener_app(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="empty body",
             )
-        # Structural check BEFORE writing (cheap DoS guard; E2EE payload-size
-        # limits land in T-101). Parse JSON and require a message_id.
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"invalid JSON: {e.msg}",
-            ) from e
-        if not isinstance(payload, dict):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="envelope must be a JSON object",
+        envelope, message_id = _extract_envelope(body)
+
+        # Replay guard — reject a duplicate *before* the inbox write. The
+        # guard emits MESSAGE_REJECTED on its own; we surface an inline
+        # ``rejected`` ACK so the sender can move the outbox file to
+        # archive without retrying.
+        if not state["replay_guard"].check_and_add(message_id):
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content=inbox_rejected(message_id, reason="replay"),
             )
-        message_id = payload.get("message_id")
-        if not message_id or not isinstance(message_id, str):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="envelope.message_id is required",
-            )
+
+        # Write the *plaintext* envelope to the inbox so the daemon's
+        # inbox processor does not need to know about crypto. The body on
+        # disk is the canonical inner envelope.
         dest = Path(state["inbox_dir"]) / f"{message_id}.json"
-        _atomic_write(dest, body)
+        payload_bytes = json.dumps(envelope, sort_keys=True).encode("utf-8")
+        atomic_write_bytes(dest, payload_bytes)
+        emit_event(
+            "MESSAGE_ACKED",
+            message_id=message_id,
+            side="receiver",
+            ack_status=ACK_STATUS_ACCEPTED,
+        )
         log.info("MESSAGE_RECEIVED message_id=%s bytes=%d", message_id, len(body))
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
-            content={"status": "accepted", "message_id": message_id},
+            content=inbox_accepted(message_id),
         )
 
     # ------------------------------------------------------------------ #
@@ -168,14 +255,32 @@ def create_listener_app(
         )
 
     # ------------------------------------------------------------------ #
-    # POST /fed/v1/ack  — 501 until T-102
+    # POST /fed/v1/ack  — sender confirms it received our inline ACK
     # ------------------------------------------------------------------ #
     @app.post("/fed/v1/ack")
     async def post_ack(request: Request, authorization: str | None = Header(None)):
         _check_auth(authorization)
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="ack handling lands in T-102",
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"invalid JSON: {e.msg}",
+            ) from e
+        try:
+            message_id, ack_status = parse_ack_body(body)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(e),
+            ) from e
+        resp = state["receiver_ack"].record(message_id, ack_status)
+        log.info(
+            "ACK_RECEIVED message_id=%s status=%s", message_id, ack_status
+        )
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=resp,
         )
 
     @app.get("/healthz")

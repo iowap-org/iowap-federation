@@ -1,17 +1,18 @@
-"""Federation Daemon (T-096).
+"""Federation Daemon (T-096 / T-101 / T-102).
 
 The daemon that runs the claim/forward/complete loop + sync cycle. It is the
 bridge between a local AI-Relay and one or more remote FedNodes.
 
 Architecture (threads, mirrors ``nodes.common.node_daemon``)::
 
-    Thread 1: Heartbeat  — heartbeats ``federation`` + the admin-approved
-              forward capabilities to the local relay (``RelayClient``).
+    Thread 1: Heartbeat  — heartbeats ``federation`` + the approved forward
+              capabilities to the local relay (``RelayClient``).
     Thread 2: Claim loop — claims stages for the approved forward caps; on
               claim, writes a forward envelope to the target peer's outbox.
     Thread 3: Sync cycle — ``sync_outbox()`` → ``sync_inbox()`` → cleanup
-              per peer (upload/download/ACK/cleanup). ACK handling is T-102;
-              T-096 only wires the sync cycle.
+              per peer. T-102: the transport now drives the ACK/retry
+              lifecycle; the daemon owns the :class:`LifecycleRegistry`
+              and the per-peer :class:`Crypto` (E2EE, T-101).
     Thread 4: Inbox processing — reads each peer's inbox files: a ``forward``
               message is re-submitted as a normal task into the local relay
               (``submit_simple_task``); a ``reply`` message completes the
@@ -24,10 +25,24 @@ network so unit tests exercise it directly with a fake ``RelayClient``.
 Entry point: console script ``federation-daemon`` (``[project.scripts]``).
 Config from ``~/.relay/node.yaml`` (``federation`` section, T-095).
 
-Plaintext envelopes for now (E2EE arrives in T-101). In-memory reply
-correlation (``_forwarded_stages``) — SQLite persistence lands in T-103.
-Replay dedupe (``_processed_messages``) is an in-memory set for T-096; the
-TTL-pruned cache is T-102.
+T-101 E2EE: when a ``Crypto`` factory is supplied (``crypto_factory=``),
+the daemon builds one :class:`federation.crypto.Crypto` per peer and
+attaches it to the peer's transport (so outbound envelopes are sealed)
+and uses it to decrypt inbound inbox files (the listener writes
+plaintext to disk, but a daemon may also receive files placed by other
+means). The default is plaintext (no crypto) — backwards compatible.
+
+T-102 lifecycle: every forward message is tracked in a
+:class:`federation.lifecycle.LifecycleRegistry`; the state machine
+(``CREATED → ENCRYPTED → QUEUED → SENT → ACKED → COMPLETED → ARCHIVED``,
+terminal ``FAILED/EXPIRED/REJECTED``) is advanced as the daemon/transport
+progress the message. Replay dedupe uses
+:class:`federation.lifecycle.ReplayGuard` (TTL-pruned). Async transports
+move a sent message to ``PENDING_REMOTE_RESPONSE`` so a worker does not
+block on the remote.
+
+In-memory reply correlation (``_forwarded_stages``) — SQLite persistence
+lands in T-103.
 
 Fair-Use enforcement (T-099) is optional: the daemon accepts a
 ``FairUseRegistry``. When the registry is ``enforce=False`` (the default)
@@ -52,9 +67,19 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from federation.config import NodeConfig, Peer, load_node_config
-from federation.fairuse import FairUse, FairUseRegistry
+from federation.crypto import Crypto, CryptoError
+from federation.envelope import open as envelope_open
+from federation.fairuse import FairUseRegistry
+from federation.lifecycle import (
+    Lifecycle,
+    LifecycleRegistry,
+    MessageState,
+    ReplayGuard,
+    RetryPolicy,
+    atomic_write_json,
+    emit_event,
+)
 from federation.paths import (
-    BASE_DIR,
     ensure_federation_dirs,
     federation_root,
     remote_dirs,
@@ -89,23 +114,12 @@ def _utcnow_str() -> str:
 # ---------------------------------------------------------------------------
 
 def _atomic_write_json(path: Path, obj: dict[str, Any]) -> None:
-    """Write ``obj`` as JSON to ``path`` atomically: tmp file + ``os.replace``."""
-    import tempfile
+    """Write ``obj`` as JSON to ``path`` atomically: tmp file + ``os.replace``.
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".tmp_{path.stem}_", dir=str(path.parent), suffix=".json"
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(obj, f, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    Thin wrapper over :func:`federation.lifecycle.atomic_write_json` so
+    the daemon uses the single source of truth for atomic I/O.
+    """
+    atomic_write_json(path, obj)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -170,6 +184,10 @@ class TransportLike(Protocol):
 # factory (HttpTransport.connect); tests inject a fake factory.
 TransportFactory = Callable[[Peer], TransportLike]
 
+# Factory: build a :class:`federation.crypto.Crypto` for a peer (T-101 E2EE).
+# Returns ``None`` when no crypto is configured for the peer (plaintext mode).
+CryptoFactory = Callable[[Peer], "Crypto | None"]
+
 
 # ---------------------------------------------------------------------------
 # FederationDaemon
@@ -192,9 +210,11 @@ class FederationDaemon:
         fed_config: NodeConfig | None = None,
         forward_caps: list[str] | None = None,
         transport_factory: TransportFactory | None = None,
+        crypto_factory: CryptoFactory | None = None,
         base_dir: Path | None = None,
         intervals: dict[str, float] | None = None,
         fairuse_registry: FairUseRegistry | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.client = client
         self.cfg = cfg
@@ -204,6 +224,7 @@ class FederationDaemon:
         # node.yaml; tests pass an explicit list.
         self.forward_caps = list(forward_caps) if forward_caps else []
         self.transport_factory = transport_factory
+        self.crypto_factory = crypto_factory
         self.base_dir = Path(base_dir) if base_dir else federation_root()
 
         # Fair-Use enforcement (T-099). Optional: when ``None`` (or when a
@@ -212,6 +233,13 @@ class FederationDaemon:
         # before calling ``client.claim`` and releases the parallel slot
         # when the reply completes (or the stage is abandoned).
         self.fairuse = fairuse_registry or FairUseRegistry(enforce=False)
+
+        # T-102 lifecycle: per-message state tracker + TTL-pruned replay
+        # guard. The registry is shared with the transport so the ACK
+        # handler can advance state.
+        self.lifecycle = LifecycleRegistry()
+        self.replay_guard = ReplayGuard()
+        self.retry_policy = retry_policy or RetryPolicy()
 
         iv = intervals or {}
         self.heartbeat_interval = iv.get("heartbeat", HEARTBEAT_INTERVAL)
@@ -232,11 +260,10 @@ class FederationDaemon:
         # T-096; T-103 moves this to SQLite.
         self._forwarded_stages: dict[str, str] = {}
 
-        # Replay dedupe: processed message_ids (T-102 adds TTL pruning).
-        self._processed_messages: set[str] = set()
-
         # Connected transports per peer id (lazy-built on first sync cycle).
         self._transports: dict[str, TransportLike] = {}
+        # Per-peer Crypto (T-101), built lazily alongside the transport.
+        self._cryptos: dict[str, Crypto | None] = {}
 
         # Observability counters (status file / smoke test).
         self.tasks_forwarded = 0
@@ -304,8 +331,10 @@ class FederationDaemon:
     def _write_forward_file(self, peer: Peer, stage: dict[str, Any]) -> str | None:
         """Write a forward envelope to the peer's outbox. Returns message_id.
 
-        Records the stage_id→task_id correlation for the reply path. Returns
-        ``None`` if the stage is unroutable.
+        Records the stage_id→task_id correlation for the reply path and
+        registers a :class:`Lifecycle` for the new message (state
+        ``CREATED`` → ``QUEUED``). Returns ``None`` if the stage is
+        unroutable.
         """
         peer_obj = peer
         inbox, outbox = ensure_federation_dirs(peer_obj.id)
@@ -314,7 +343,27 @@ class FederationDaemon:
         stage_id = envelope["_origin"]["stage_id"]
         task_id = envelope["_origin"]["task_id"]
         dest = outbox / f"{message_id}.json"
-        _atomic_write_json(dest, envelope)
+        atomic_write_json(dest, envelope)
+        # Register + advance the lifecycle tracker.
+        lc = Lifecycle(message_id=message_id, state=MessageState.CREATED)
+        try:
+            self.lifecycle.register(lc)
+            emit_event(
+                "MESSAGE_CREATED",
+                message_id=message_id,
+                peer=peer_obj.id,
+                capability=envelope["capability"],
+                stage=stage_id,
+            )
+            lc.queued()
+        except ValueError:
+            # Already registered (rare re-entrance) — fetch + re-queue.
+            lc = self.lifecycle.get(message_id)
+            if lc is not None:
+                try:
+                    lc.queued()
+                except Exception:  # noqa: BLE001
+                    pass
         # Record correlation so the reply can complete our stage.
         if stage_id:
             with self._lock:
@@ -385,30 +434,73 @@ class FederationDaemon:
             if policy is not None:
                 policy.release()
 
+    def _decrypt_inbox_file(self, peer: Peer, raw: dict[str, Any]) -> dict[str, Any] | None:
+        """Decrypt an inbox file body if it is a ciphertext envelope.
+
+        The listener writes plaintext envelopes to disk (after decrypting
+        inbound POSTs), so in the normal path this is a no-op. However, a
+        daemon may also pick up files placed by other means (e.g. an
+        email transport drops a ciphertext envelope). When a Crypto is
+        configured for the peer and the file looks like a ciphertext
+        envelope (``ciphertext`` + ``nonce``), decrypt it here.
+
+        Returns the plaintext envelope dict, or ``None`` on decrypt
+        failure (the caller skips the file). When the body is already
+        plaintext, it is returned unchanged.
+        """
+        if not isinstance(raw, dict):
+            return None
+        if "ciphertext" not in raw or "nonce" not in raw:
+            return raw  # plaintext path
+        crypto = self._cryptos.get(peer.id)
+        if crypto is None:
+            # File looks encrypted but we have no key for this peer — skip.
+            log.warning(
+                "inbox file is ciphertext but no crypto for peer %s — skipping",
+                peer.id,
+            )
+            return None
+        try:
+            inner, header = envelope_open(crypto, raw)
+        except CryptoError as e:
+            log.error("inbox decrypt failed for peer %s: %s", peer.id, e)
+            return None
+        emit_event("MESSAGE_DECRYPTED", message_id=header["message_id"])
+        return inner
+
     def _process_inbox_file(self, peer: Peer, path: Path) -> str | None:
         """Process a single inbox file. Returns the action taken or ``None``.
 
         Actions: ``"submitted"`` (forward → local task), ``"completed"``
-        (reply → complete our stage), ``"duplicate"`` (replay), ``"skipped"``.
-        Removes the file once processed (T-102 replaces this with the
-        lifecycle/ACK state machine).
+        (reply → complete our stage), ``"duplicate"`` (replay),
+        ``"skipped"``. Removes the file once processed.
+
+        T-102: replay dedupe uses the TTL-pruned :class:`ReplayGuard`.
+        Encrypted inbox files are decrypted via :meth:`_decrypt_inbox_file`
+        when a Crypto is configured for the peer.
         """
-        envelope = _read_json(path)
+        raw = _read_json(path)
+        if raw is None:
+            return "skipped"
+        envelope = self._decrypt_inbox_file(peer, raw)
         if envelope is None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
             return "skipped"
         message_id = str(envelope.get("message_id") or "")
         if not message_id:
             log.warning("inbox file %s has no message_id — skipping", path.name)
             return "skipped"
-        # Replay dedupe (in-memory for T-096).
-        if message_id in self._processed_messages:
+        # Replay dedupe (T-102: TTL-pruned ReplayGuard).
+        if not self.replay_guard.check_and_add(message_id):
             log.info("duplicate message_id=%s — ignoring", message_id)
             try:
                 path.unlink()
             except OSError:
                 pass
             return "duplicate"
-        self._processed_messages.add(message_id)
 
         direction = str(envelope.get("direction") or "")
         etype = str(envelope.get("type") or "")
@@ -476,6 +568,15 @@ class FederationDaemon:
                             "MESSAGE_COMPLETED message_id=%s stage=%s task=%s",
                             message_id, remote_task_id, task_id,
                         )
+                        # T-102: advance the forward message's lifecycle
+                        # to COMPLETED (the reply correlates via
+                        # remote_task_id == our stage_id).
+                        lc = self.lifecycle.get(remote_task_id)
+                        if lc is not None:
+                            try:
+                                lc.completed()
+                            except Exception:  # noqa: BLE001
+                                pass
                         # Fair-use release (T-099): the forwarded task is
                         # done — free its parallel slot.
                         rel_policy = self.fairuse.for_cap(capability)
@@ -501,7 +602,8 @@ class FederationDaemon:
             )
             action = "skipped"
 
-        # T-096: remove once processed. T-102 lifecycle keeps files until ACK.
+        # T-096: remove once processed. T-102 lifecycle keeps the *sender's*
+        # outbox file until ACK; the receiver's inbox file is consumed here.
         try:
             path.unlink()
         except OSError as exc:
@@ -522,7 +624,13 @@ class FederationDaemon:
         return count
 
     def _get_transport(self, peer: Peer) -> TransportLike | None:
-        """Lazily build + connect a transport for a peer (cached)."""
+        """Lazily build + connect a transport for a peer (cached).
+
+        Also builds (and caches) the per-peer :class:`Crypto` via
+        ``crypto_factory`` (T-101) and attaches it + the lifecycle
+        registry + retry policy to the transport (T-102) so the
+        transport's ACK/retry handler can advance state.
+        """
         if peer.id in self._transports:
             return self._transports[peer.id]
         if self.transport_factory is None:
@@ -532,14 +640,36 @@ class FederationDaemon:
         except Exception as exc:  # noqa: BLE001
             log.warning("transport for peer %s failed to connect: %s", peer.id, exc)
             return None
+        # T-101: build + attach the per-peer Crypto (if a factory is set).
+        if peer.id not in self._cryptos:
+            if self.crypto_factory is not None:
+                try:
+                    self._cryptos[peer.id] = self.crypto_factory(peer)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("crypto for peer %s failed: %s", peer.id, exc)
+                    self._cryptos[peer.id] = None
+            else:
+                self._cryptos[peer.id] = None
+        # Wire T-102 lifecycle into the transport (if it supports it).
+        crypto = self._cryptos.get(peer.id)
+        for attr, value in (
+            ("crypto", crypto),
+            ("registry", self.lifecycle),
+            ("retry_policy", self.retry_policy),
+        ):
+            if hasattr(t, attr):
+                setattr(t, attr, value)
         self._transports[peer.id] = t
         return t
 
     def _sync_one_peer(self, peer: Peer) -> dict[str, list[str]]:
         """Run one sync cycle for a peer: outbox → inbox.
 
-        Returns ``{"sent": [...], "received": [...]}``. ACK/cleanup land in
-        T-102; T-096 only wires the sync calls.
+        Returns ``{"sent": [...], "received": [...]}``. T-102: the
+        transport drives the ACK/retry lifecycle internally; here we
+        advance any tracked messages from ``QUEUED`` → ``SENT`` for the
+        ids the transport reports as accepted, and move async ones to
+        ``PENDING_REMOTE_RESPONSE``.
         """
         inbox, outbox = remote_dirs(peer.id)
         outbox.mkdir(parents=True, exist_ok=True)
@@ -549,6 +679,17 @@ class FederationDaemon:
             return {"sent": [], "received": []}
         sent = transport.sync_outbox(outbox)
         received = transport.sync_inbox(inbox)
+        # Advance lifecycle for accepted sends: the transport's ACK handler
+        # already moved them through ACKED→COMPLETED→ARCHIVED, so we only
+        # need to catch messages the transport could not track (no
+        # registry wiring on a fake transport).
+        for mid in sent:
+            lc = self.lifecycle.get(mid)
+            if lc is not None and lc.state is MessageState.QUEUED:
+                try:
+                    lc.sent()
+                except Exception:  # noqa: BLE001
+                    pass
         return {"sent": list(sent), "received": list(received)}
 
     # ------------------------------------------------------------------ #
@@ -576,6 +717,21 @@ class FederationDaemon:
             "tasks_submitted": self.tasks_submitted,
             "stages_completed": self.stages_completed,
             "pending_replies": len(self._forwarded_stages),
+            "lifecycle": {
+                "tracked": len(self.lifecycle),
+                "queued": self.lifecycle.count_in_state(MessageState.QUEUED),
+                "sent": self.lifecycle.count_in_state(MessageState.SENT),
+                "pending_remote_response": self.lifecycle.count_in_state(
+                    MessageState.PENDING_REMOTE_RESPONSE
+                ),
+                "acked": self.lifecycle.count_in_state(MessageState.ACKED),
+                "completed": self.lifecycle.count_in_state(MessageState.COMPLETED),
+                "archived": self.lifecycle.count_in_state(MessageState.ARCHIVED),
+                "failed": self.lifecycle.count_in_state(MessageState.FAILED),
+                "rejected": self.lifecycle.count_in_state(MessageState.REJECTED),
+                "expired": self.lifecycle.count_in_state(MessageState.EXPIRED),
+            },
+            "replay_cache_size": len(self.replay_guard),
             "error": error,
             "auth_backoff_seconds": backoff,
         }
