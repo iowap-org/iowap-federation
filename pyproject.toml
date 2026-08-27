@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 
 [project.scripts]
 federation-daemon = "federation.federation_node:main"
+fed-cli = "federation.cli:main"
 
 [tool.setuptools]
 packages = ["federation", "federation.transports"]
