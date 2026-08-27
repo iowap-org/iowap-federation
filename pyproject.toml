@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iowap-federation"
+version = "0.1.0"
+description = "IOWAP Federation Node — bridge capabilities between relays"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+packages = ["federation", "federation.transports"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
