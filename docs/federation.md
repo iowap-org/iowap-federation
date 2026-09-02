@@ -1,11 +1,11 @@
-# Federation Node — Concept
+# Federation Node — Concept & Implementation
 
-> **⚠️ Concept — not yet implemented.** This document describes the planned
-> Federation Node based on discussions (2026-08-01) and subsequent design
-> refinements (2026-08-03). No code exists yet.
-> See [IDEAS.md](../../.hermes/projects/iowap-server/IDEAS.md) for the
-> original idea and [TASKS.md](../../.hermes/projects/iowap-server/TASKS.md)
-> for the current board state.
+> **Status (2026-09-02):** the V1 forward path is **implemented** in this repo
+> (`federation/` package, T-094–T-103 done, 337 tests). The design sections
+> below are still accurate; sections marked ✅ match the shipped code, 🚧
+> marks the open pieces. See [Implementation status](#implementation-status)
+> at the bottom and the board in `~/.hermes/projects/iowap-federation/TASKS.md`.
+> The original idea lives in `~/.hermes/projects/iowap-server/IDEAS.md`.
 
 ## What is a Federation Node?
 
@@ -121,7 +121,7 @@ This solves three problems:
 3. **Targeted routing** — the admin dashboard shows `chat.ai@b`, and tasks in A
    target that address.
 
-## Core architecture: Inbox/Outbox + transport-agnostic node
+## Core architecture: Inbox/Outbox + transport-agnostic node ✅
 
 The Federation Node is built on the **Inbox/Outbox message pattern** (the same
 pattern proven in the Hermes Gateway Bridge Adapter). The node itself is
@@ -185,7 +185,7 @@ the only component that touches the network.
 > the fair-use daily cap (superseding the in-memory counters). Atomic
 > writes (``.tmp_<id>`` + ``os.replace``) are preserved everywhere.
 
-## Transport abstraction
+## Transport abstraction ✅
 
 > **Location (2026-08-27):** the Federation code lives in the
 > `iowap-federation` repo as its own package `federation/`, importing
@@ -199,9 +199,9 @@ server (`core/db.py`): a `Database` protocol → `create_database()` factory on
 `transport_type`.
 
 ```python
-# federation/transport.py   (was: nodes/common/federation/transport.py)
-class Transport:
-    """Pluggable federation transport backend.
+# federation/transport.py
+class Transport(ABC):
+    """Abstract federation transport backend.
 
     The only component that touches the network. Translates files in
     inbox/outbox into transport calls (HTTP, E-Mail, P2P). Carries the
@@ -231,17 +231,13 @@ class Transport:
 
 
 def create_transport(cfg: dict[str, Any]) -> Transport:
-    transport_type = cfg.get("federation.transport_type", "http")
+    """Dispatch on cfg["federation"]["transport_type"] (default "http")."""
+    transport_type = cfg.get("federation", {}).get("transport_type", "http")
     if transport_type == "http":
         from federation.transports.http_transport import HttpTransport
-        # (was: from nodes.common.federation.transports.http_transport import HttpTransport)
         return HttpTransport(cfg)
-    # if transport_type == "email":   # T-100
-    #     from ...email_transport import EmailTransport
-    #     return EmailTransport(cfg)
-    # if transport_type == "p2p":     # later, optional
-    #     from ...p2p_transport import P2pTransport
-    #     return P2pTransport(cfg)
+    # email (T-100) and p2p are not implemented yet:
+    # create_transport raises ValueError("... not implemented yet (T-100 / later)")
     raise ValueError(f"Unknown transport_type: {transport_type!r}")
 ```
 
@@ -262,7 +258,7 @@ which is itself an asynchronous message queue) needs no node changes — only a
 new `Transport` class behind the factory. The choice of transport is purely a
 config line; it has no effect on the node, handler, or dashboard.
 
-## Security: message-level end-to-end encryption
+## Security: message-level end-to-end encryption ✅ (library) / 🚧 (wiring)
 
 Because the transport is open-ended, security must **not** depend on any one
 transport. It lives at the **message layer**: the JSON payload is encrypted by
@@ -270,6 +266,14 @@ the Federation Node *before* it is written to `outbox/`, and decrypted only
 when read from `inbox/`. The transport wrapper moves ciphertext and nothing
 else, so confidentiality, authenticity and integrity hold across HTTP, E-Mail
 and P2P alike. (Security model validated by external review, 2026-08-03.)
+
+> **Wiring gap (2026-09-02):** the E2EE machinery is implemented and tested
+> (`federation/crypto.py`, `federation/envelope.py`, daemon `crypto_factory`,
+> listener `crypto=`), but `federation-daemon` (`main()`) and
+> `create_app_from_config_file()` do **not** build a `Crypto` from the peer
+> keys yet — production entry points currently run plaintext even when
+> `peer_public_key`/`my_public_key` are configured. Wiring both is an open
+> task (see [Open gaps](#open-gaps)).
 
 ### Layered model
 
@@ -303,7 +307,7 @@ the payload.
 ### Crypto scheme
 
 - Each relay has an X25519 keypair; public keys are shared **out-of-band**
-  (e.g. during the `connect` task with the token, or manually).
+  (per-peer via `federation.peers`, see [Key management](#key-management)).
 - Every message gets a **fresh 24-byte random nonce** via `os.urandom(24)` /
   libsodium `randombytes_buf`. **Never reuse a nonce with the same keypair** —
   a collision destroys confidentiality. XChaCha20's 192-bit nonce space makes
@@ -311,12 +315,12 @@ the payload.
 - The plaintext envelope carries: a unique message id (`jti`), a strict
   timestamp, and a **key fingerprint** of the sender's public key so the
   receiver knows which Curve25519 key to use for decryption.
-
-```python
-import nacl.bindings
-# encrypt: local_sk + remote_pk + nonce → ciphertext
-# decrypt: remote_sk + local_pk + nonce → plaintext
-```
+- On the wire, the plaintext envelope is sealed into a **ciphertext envelope**
+  (`federation/envelope.py`): `message_id` + `sender_fp` + `created_at` +
+  `nonce` + `ciphertext`. `message_id` and `sender_fp` are deliberately in
+  the clear — the receiver needs them for replay dedupe and key selection
+  *before* paying the decrypt cost. `federation/crypto.py` provides the
+  `Crypto` wrapper (crypto_box), the `SizeGuard`, and fingerprint encoding.
 
 ### Hard requirements (built in from day one)
 
@@ -338,15 +342,15 @@ relays). For rotation/revocation, prefer **TOFU with local config pinning**
 when the federation grows. A leaked private key requires rotating it across
 all federated partners.
 
-Config:
+Config: keys are per-peer — `peer_public_key` / `my_public_key` in the
+`federation.peers` entries (see [Config](#config)). The daemon accepts a
+`crypto_factory` (`Callable[[Peer], Crypto | None]`); peers without keys run
+in plaintext mode (backwards compatible).
 
-```yaml
-federation:
-  transport_type: http
-  crypto:
-    local_private_key: "..."     # stays on this relay
-    remote_public_key: "..."     # public key of the remote relay
-    key_fingerprint: "..."       # optional: pin the remote key id
+```python
+import nacl.bindings
+# encrypt: local_sk + remote_pk + nonce → ciphertext
+# decrypt: remote_sk + local_pk + nonce → plaintext
 ```
 
 ### Scalability (future, not V1)
@@ -372,13 +376,15 @@ federation:
 
 ### `federation`
 
-The Federation Node heartbeats `federation` as its only capability. It does not
-heartbeat the remote capabilities directly — those are only heartbeated after
-the local admin approves them via the dashboard.
+The Federation Node heartbeats `federation` as its only capability, plus the
+capabilities approved for forwarding (`forward_caps`, derived from the local
+task flow — see `_default_forward_caps()`). It does not heartbeat the remote
+capabilities directly — those are only heartbeated after the local admin
+approves them via the dashboard.
 
 ## How it works
 
-### 1. Peer registration (out-of-band, not a connect task)
+### 1. Peer registration (out-of-band, not a connect task) ✅
 
 The federation channel credentials are exchanged **out-of-band** by the two
 operators/admins. Each Federation Node has a set of configured peers in
@@ -399,9 +405,9 @@ federation:
 Peers are managed with the CLI (no config edit needed for temporary bridges):
 
 ```bash
-node-cli federation peer add fed-b https://fed-b:8791 fed_t_... <pubkey>
-node-cli federation peer remove fed-b
-node-cli federation peer list
+fed-cli federation peer add fed-b https://fed-b:8791 fed_t_... <pubkey>
+fed-cli federation peer remove fed-b
+fed-cli federation peer list
 ```
 
 **Why out-of-band (no dynamic handshake endpoint in V1):** the trust anchor is
@@ -409,7 +415,7 @@ the manually shared configuration. There is no initial handshake that would
 itself be an attack surface, and no new endpoint on the Fed-Side. This is the
 same out-of-band pattern already used for the E2EE public-key distribution.
 
-### 2. Mutual authentication (every sync cycle)
+### 2. Mutual authentication (every sync cycle) ✅ (token) / 🚧 (E2EE wiring)
 
 Each sync authenticates both directions without any relay involvement:
 
@@ -421,15 +427,17 @@ Together these give mutual authentication between the two Federation Nodes,
 independent of both relays. Once the peer is activated, the node builds the
 transport via `create_transport(cfg)` and starts syncing.
 
-### 3. Discover
+### 3. Discover ✅
 
 Once connected, the transport fetches the remote **peer node's** capability
-list via `discover_capabilities()`:
+offer via `discover_capabilities()` — on the HTTP transport this is
+`GET /fed/v1/discover` on the remote listener, which returns the peer's
+`federation.offer` list from its `node.yaml`:
 ```
 [mflux.generate, esrgan.upscale, chat.ai]
 ```
 
-### 4. Dashboard page = the subscription catalog
+### 4. Dashboard page = the subscription catalog 🚧
 
 The node deploys a dashboard page (via the SSN's `ssn.pages` capability or its
 own Dynamic Route). It acts as a **subscription catalog** — it shows the
@@ -448,7 +456,11 @@ automatically.
 Remote capabilities are **only visible here** — they are not in the local
 relay and not heartbeated until explicitly subscribed.
 
-### 5. Subscribe (manual approval, default: no import)
+### 5. Subscribe (manual approval, default: no import) 🚧
+
+> The subscription **model** is designed as below; the dashboard page that
+> drives it was deferred to the server board (T-098 → iowap-server T-098).
+> Fair-use limits per capability are enforced in the daemon (T-099).
 
 The admin reviews each remote capability against a checklist (need, trust
 level, sensitivity, fair-use, version/pinning) and explicitly subscribes to
@@ -471,27 +483,29 @@ or schema), your existing subscription does **not** silently change. It is
 flagged as "update available" and requires re-review by the admin before it
 takes effect.
 
-### 6. Node heartbeats approved capabilities
+### 6. Node heartbeats approved capabilities ✅
 
 Only after admin approval, the node starts heartbeating the approved
 capabilities locally. The relay now sees `image.gen.mflux` as a local
 capability.
 
-### 7. Task forwarding
+### 7. Task forwarding 🚧
 
 When a task arrives for `image.gen.mflux`:
 
-1. Federation Node A claims the stage
-2. Node A writes a forward file to `outbox/<remote>/`
+1. Federation Node A claims the stage ✅
+2. Node A writes a forward file to `outbox/<remote>/` ✅
 3. Transport A `sync_outbox()` sends it **only to Federation Node B**
-   (over HTTP — it never talks to Relay B's scheduler directly)
+   (over HTTP — it never talks to Relay B's scheduler directly) ✅
 4. Federation Node B receives it and submits it **as a normal task into its
-   own local Relay B** (using B's own node token, `POST /relay/v2/scheduler/task-simple`)
+   own local Relay B** (using B's own node token, `POST /relay/v2/scheduler/task-simple`) ✅
 5. Relay B matches the capability and routes it to its regular worker nodes,
-   which process it normally
+   which process it normally ✅
 6. Transport A `sync_inbox()` fetches the result from Federation Node B,
-   writes it as an inbox file
-7. Node A reads the inbox file, completes the stage locally
+   writes it as an inbox file 🚧 *(B does not yet watch its local task to
+   produce the reply envelope — the inbox→complete path itself is
+   implemented and tested)*
+7. Node A reads the inbox file, completes the stage locally ✅
 
 **Key point:** the HTTP transport never reaches the remote relay's scheduler
 directly. It only reaches the remote Federation Node, which then re-submits
@@ -501,26 +515,33 @@ claim and execute it, with no knowledge that it came from a federation.
 
 ## Config
 
+The federation lives in the `federation:` section of `~/.relay/node.yaml`
+(the same file the daemon reads for its relay connection). Schema:
+`federation/config.py` → `load_node_config_from_dict()`.
+
 ```yaml
-# ~/.relay/node.yaml (Federation Node)
-node_name: federation
+# ~/.relay/node.yaml (Federation Node, Fed A)
+node_name: fed-a
 description: "Bridge to remote relays"
 federation:
-  transport_type: http        # http | email | p2p
-  peers:
+  transport_type: http        # http implemented; email/p2p raise ValueError
+  listener_token: "fed_t_a_..."   # what peers must present to OUR listener
+  peers:                      # managed via `fed-cli federation peer ...`
     - id: "fed-b"
       endpoint: "https://fed-b:8791"
-      token: "fed_t_..."          # out-of-band, from the remote operator
+      token: "fed_t_b_..."        # B's listener token, out-of-band
       peer_public_key: "..."      # Fed B's X25519 public key (out-of-band)
       my_public_key: "..."        # Fed A's X25519 public key (shared with B)
-capabilities:
-  - name: federation
-    type: native
-    claimable: true
-    handler: /opt/relay/handlers/federation-handler.sh
-    max_parallel: 10
-    timeout: 600
-    description: "Bridges capabilities from remote relays"
+  offer:                      # capabilities we expose to peers (GET /fed/v1/discover)
+    - name: image.gen
+      claimable: true
+```
+
+Run the two processes:
+
+```bash
+federation-daemon                 # entry point: federation.federation_node:main
+uvicorn federation.listener:create_app_from_config_file --factory --port 8791
 ```
 
 ## Dashboard page
@@ -570,7 +591,7 @@ inbox/outbox directory. Each connection has its own dashboard card:
 └──────────────────────────────────────────────┘
 ```
 
-## Reliability & lifecycle (from Gemini + OpenAI reviews, 2026-08-03)
+## Reliability & lifecycle (from Gemini + OpenAI reviews, 2026-08-03) ✅
 
 ### Message lifecycle + ACK protocol
 
@@ -702,27 +723,75 @@ manual approval (default no import), E2EE, Inbox/Outbox.
 - **Fair use** — `max_parallel`, `max_daily` as policy mechanism, no money
 - **Temporary bridges** — connect, use, disconnect. No permanent setup needed
 
-## What the Federation Node needs (node code, no relay code)
+## Implementation status
+
+Task board: `~/.hermes/projects/iowap-federation/TASKS.md`. As of 2026-09-02:
+
+| Task | Scope | Status |
+|------|-------|--------|
+| T-094 | Transport wrapper (Inbox/Outbox protocol, transport-agnostic) | ✅ done |
+| T-095 | HTTP backend + FastAPI listener (`/fed/v1/inbox`, `/ack`, `/discover`, `/results`) | ✅ done (`/results` = 501 stub) |
+| T-096 | `federation_node.py` daemon (claim/forward/complete loop) | ✅ done |
+| T-097 | Peer management (CLI + `node.yaml`) | ✅ done |
+| T-098 | Dashboard subscription page | ⏸ deferred → iowap-server T-098 |
+| T-099 | Fair use (`max_parallel`, `max_daily`) | ✅ done |
+| T-100 | E-Mail transport (openness proof) | 📝 todo |
+| T-101 | E2EE (`crypto_box`) | ✅ done (library) — 🚧 wiring |
+| T-102 | Message lifecycle + ACK | ✅ done |
+| T-103 | SQLite metadata index | ✅ done |
+| T-104 | Capability pinning (`schema_hash` drift guard) | 📝 todo |
+| T-105 | Back-pressure (`queue_depth`, load routing) | 📝 todo |
+| T-106 | P2P discovery (mesh) — Phase 23 | 📝 later |
+| T-107 | Channel model (gateway) — Phase 24 | 📝 later |
+
+Test suite: 337 passed (`pytest`, incl. daemon unit surface, HTTP transport
+via mock layer, listener API, envelope/crypto, lifecycle/ACK, index, fair-use).
+
+## Open gaps (V1 to "actually usable end-to-end")
+
+1. **Result return leg (B → A)** — B carries `remote_task_id` in its local
+   task metadata (`submit_simple_task(..., owner_node_id=...)`), but no code
+   yet watches the local task and emits the `reply` envelope. A-side: the
+   inbox→complete path exists and is tested (correlation via
+   `remote_task_id == stage_id`). Also open: `GET /fed/v1/results/{id}` is a
+   501 stub on the listener.
+2. **E2EE wiring** — `federation-daemon` and `create_app_from_config_file()`
+   don't construct a `Crypto` from peer keys yet; plaintext on production
+   entry points (library fully tested).
+3. **Subscription dashboard** — T-098 deferred to the server board; fair-use
+   and the subscription model exist, the approval UI doesn't.
+4. **Capability pinning (T-104)** — `schema_hash` drift guard not implemented.
+5. **Back-pressure (T-105)** — `queue_depth`/load routing not implemented.
+
+## What the Federation Node needs (node code, no relay code) — implemented ✅
 
 > **Location (2026-08-27):** these paths are historical (`nodes/common/federation/`
 > in iowap-node). The code now lives in the `iowap-federation` repo as the
 > `federation/` package, importing `nodes.common.*` from the iowap-node
 > framework (same pattern as iowap-storage).
 
-- `federation/transport.py` — `Transport` protocol + `create_transport()` factory
-- `federation/transports/http_transport.py` — HTTP backend (V1)
-- `federation/federation_node.py` — Daemon (claim, forward, complete; inbox/outbox processing)
-- `federation` handler — peer management, capability discovery
-- Dashboard HTML (capability page or Dynamic Route) — subscription catalog, peer status
-- Fair-use policy — `max_parallel`, `max_daily` enforcement in the daemon
+- `federation/transport.py` — `Transport` protocol + `create_transport()` factory ✅
+- `federation/transports/http_transport.py` — HTTP backend (V1) ✅
+- `federation/federation_node.py` — Daemon (claim, forward, complete; inbox/outbox processing) ✅
+- `federation/listener.py` — FastAPI listener (`/fed/v1/inbox`, `/ack`, `/discover`, `/healthz`) ✅
+- `federation/envelope.py` + `federation/crypto.py` — E2EE sealing, SizeGuard ✅ (wiring into `main()`/listener factory open)
+- `federation/lifecycle.py` + `federation/ack.py` — state machine, replay guard, ACK ledgers ✅
+- `federation/index.py` — SQLite metadata index + archive/prune ✅
+- `federation/fairuse.py` — `max_parallel`, `max_daily` enforcement in the daemon ✅
+- `federation/peers.py` + `federation/cli.py` — peer management (`fed-cli`) ✅
+- Dashboard HTML (capability page or Dynamic Route) — subscription catalog, peer status 🚧 (deferred → iowap-server T-098)
+- `federation` handler — peer management, capability discovery (replaced by the CLI + listener endpoints)
 - Later: one channel adapter per medium (X, ActivityPub, web, messaging) — Phase 24+
 
 ## See also
 
-- **[concept.md](concept.md)** — what a node is
-- **[capability-concept.md](capability-concept.md)** — what a capability is
-- **[capabilities.md](capabilities.md)** — capability reference, naming, handler contract
-- **[ssn.md](ssn.md)** — SSN implementation (hosts the federation dashboard page)
-- **[node-config.md](node-config.md)** — `node.yaml` format
-- **Inbox/Outbox pattern** — inspired by the Hermes Gateway Bridge Adapter
-- **Pluggable backend pattern** — mirrors `core/db.py` (`Database` → `create_database()`)
+> The linked node docs live in the **iowap-server** repo
+> (`docs/node/…`): [concept.md](https://github.com/iowap-org/iowap-server/blob/main/docs/node/concept.md),
+> [capability-concept.md](https://github.com/iowap-org/iowap-server/blob/main/docs/node/capability-concept.md),
+> [capabilities.md](https://github.com/iowap-org/iowap-server/blob/main/docs/node/capabilities.md),
+> [node-config.md](https://github.com/iowap-org/iowap-server/blob/main/docs/node/node-config.md).
+>
+> - **Inbox/Outbox pattern** — inspired by the Hermes Gateway Bridge Adapter
+> - **Pluggable backend pattern** — mirrors the server's `core/db.py`
+>   (`Database` → `create_database()`)
+> - **[federation.md in iowap-server](https://github.com/iowap-org/iowap-server/blob/main/docs/node/federation.md)** — server-side view
