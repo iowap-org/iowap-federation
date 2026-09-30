@@ -119,3 +119,7 @@ The full design document lives in **[docs/federation.md](docs/federation.md)**.
 | 22 | Federation V1 (HTTP, pairwise) | T-094–T-105 | 🚧 in progress — T-094–T-103 done, T-104–T-105 open |
 | 23 | P2P discovery | T-106 | later |
 | 24 | Channel model / gateway | T-107 | later |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
