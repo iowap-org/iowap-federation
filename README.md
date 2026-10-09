@@ -6,9 +6,10 @@ A specialized IOWAP node that lets one relay use another relay's capabilities
 without the relays ever knowing each other exist. Built on the Inbox/Outbox
 message pattern with message-layer end-to-end encryption.
 
-> **Status:** V1 forward path is implemented (T-094–T-103, 2026-08-27) and
-> covered by 337 tests. Not yet wired end-to-end: the **result return leg**
-> (B → A reply delivery + results endpoint) and dashboard-driven
+> **Status:** V1 forward path implemented; result return leg open (canonical
+> string — keep verbatim across repos; detail: "Implementation status" below
+> and in the umbrella board). Not yet wired end-to-end: the **result return
+> leg** (B → A reply delivery + results endpoint) and dashboard-driven
 > subscription management (T-098, moved to the server board). See
 > [docs/federation.md](docs/federation.md) → "Implementation status" and
 > "Open gaps".

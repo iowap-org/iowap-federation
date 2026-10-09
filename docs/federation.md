@@ -3,7 +3,8 @@
 > **Concept source of truth:** [iowap-docs → federation/concept.md](https://github.com/iowap-org/iowap-docs/blob/main/federation/concept.md)
 > (readable live at any relay: `/relay/v2/docs/federation-concept`).
 >
-> **Implementation status:** the V1 forward path is implemented in this
+> **Implementation status (canonical: "V1 forward path implemented; result
+> return leg open"):** the V1 forward path is implemented in this
 > repo (`federation/` package, forward-path tasks done, test suite in
 > `tests/`); the section-by-section status table lives further below.
 > Framework-internal APIs for developing against the node framework:
