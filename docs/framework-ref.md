@@ -1,85 +1,86 @@
-# iowap-node Framework API Reference (für Federation-Entwicklung)
+# iowap-node Framework API Reference (for Federation development)
 
-> Dieses Referenz-File liegt im Federation-Repo, damit der Code-Entwickler die
-> Framework-APIs nutzen kann, ohne in das `~/projects/iowap-node`-Verzeichnis
-> schauen zu müssen (Permission-Sandbox blockt externe Verzeichnisse). Das
-> Framework ist als Editable-Install im venv verfügbar — Importe funktionieren.
+> This reference file lives in the federation repo so that the code developer
+> can use the framework APIs without having to look into the
+> `~/projects/iowap-node` directory (the permission sandbox blocks external
+> directories). The framework is available as an editable install in the
+> venv — imports work.
 
-## Verfügbarkeit
+## Availability
 
 ```bash
-.venv/bin/pip install -e ../iowap-node   # Editable-Install im venv
+.venv/bin/pip install -e ../iowap-node   # editable install into the venv
 .venv/bin/python -c "from nodes.common.relay_client import RelayClient"
 ```
 
 ## nodes.common.relay_client.RelayClient
 
-Der gemeinsame HTTP-Client zu einem AI-Relay. Der Federation Daemon nutzt ihn,
-um als normaler Node am Relay zu heartbeaten, Stages zu claimen, Tasks zu
-completen und Tasks einzureichen.
+The shared HTTP client to an AI relay. The federation daemon uses it to
+heartbeat to the relay as a normal node, claim stages, complete tasks, and
+submit tasks.
 
-Konstruktor:
+Constructor:
 ```python
 client = RelayClient(meta: dict, cfg: dict)
-# meta:  {"node_id": str, "node_name": str, ...} (aus iowap-agent.json)
-# cfg:   relay_config.json gemerged mit env-overrides (_effective_config())
-# Eigenschaften: client.base_url (str), client.token (str), client.meta
+# meta:  {"node_id": str, "node_name": str, ...} (from iowap-agent.json)
+# cfg:   relay_config.json merged with env overrides (_effective_config())
+# Properties: client.base_url (str), client.token (str), client.meta
 ```
 
-### Wichtigste Methoden
+### Key methods
 
-| Methode | Zweck |
+| Method | Purpose |
 |---------|-------|
-| `heartbeat(caps: list[dict], in_flight: dict[str,int]) -> dict` | Heartbeat an `/relay/v2/discovery/heartbeat`. `caps` = aktive Capabilities, `in_flight` = {cap_name: count}. |
-| `claim(capability: str) -> dict \| None` | Claimt einen Stage. `None` bei 204 (nichts claimbar). Sonst `stage` dict mit `stage_id`, `task_id`, `payload`. |
-| `complete(task_id: str, stage_id: str, result: dict) -> dict` | Meldet Ergebnis eines Stages an `/relay/v2/scheduler/stages/{stage_id}/complete`. |
-| `submit_simple_task(capability: str, payload: dict, *, name="", priority=0, owner_node_id=None) -> dict` | Reicht einen neuen Task ein. Der Remote-FedNode nutzt das, um einen ankommenden Forward-Task in seinen lokalen Relay einzureichen. |
-| `get_task(task_id: str) -> dict` | Task-Details inkl. Stages/Artifacts/Notes. |
+| `heartbeat(caps: list[dict], in_flight: dict[str,int]) -> dict` | Heartbeat to `/relay/v2/discovery/heartbeat`. `caps` = active capabilities, `in_flight` = {cap_name: count}. |
+| `claim(capability: str) -> dict \| None` | Claims a stage. `None` on 204 (nothing claimable). Otherwise a `stage` dict with `stage_id`, `task_id`, `payload`. |
+| `complete(task_id: str, stage_id: str, result: dict) -> dict` | Reports the result of a stage to `/relay/v2/scheduler/stages/{stage_id}/complete`. |
+| `submit_simple_task(capability: str, payload: dict, *, name="", priority=0, owner_node_id=None) -> dict` | Submits a new task. The remote FedNode uses this to submit an incoming forwarded task into its local relay. |
+| `get_task(task_id: str) -> dict` | Task details incl. stages/artifacts/notes. |
 
-### Token-Handling (zentral, kein manueller Refresh nötig)
+### Token handling (central, no manual refresh needed)
 
-- `maybe_refresh_token()` — proaktiv refresh vor Ablauf (in heartbeat-loop aufrufen).
-- `_current_backoff() -> float` — Auth-Fehler-Backoff (0 = ok). In Status schreiben.
-- Auth/Refresh/Recovery ist im Client gekapselt; `_post_with_retry`/`_get_with_retry` handlen 401/403 automatisch.
+- `maybe_refresh_token()` — proactive refresh before expiry (call in the heartbeat loop).
+- `_current_backoff() -> float` — auth-error backoff (0 = ok). Write into the status.
+- Auth/refresh/recovery is encapsulated in the client; `_post_with_retry`/`_get_with_retry` handle 401/403 automatically.
 
-## nodes.common.node_daemon (Referenz-Muster)
+## nodes.common.node_daemon (reference pattern)
 
-Das SSE-getriebene Daemon-Muster zeigt die Thread-Struktur, die der Federation
-Daemon nachbilden soll (T-096). Kernpunkte:
+The SSE-driven daemon pattern shows the thread structure that the federation
+daemon should mirror (T-096). Key points:
 
 - **Thread 1 — Heartbeat:** `while not stop: client.maybe_refresh_token(); caps = load_active_profile(); with lock: inflight=dict(self._in_flight); hb = client.heartbeat(caps, inflight); sleep(interval + client._current_backoff())`
 - **Claim/Execute/Complete:** `stage = client.claim(cap); ... context = {...RELAY_* envs...}; result = run_handler(handler, stage, context=ctx, timeout=...); client.complete(task_id, stage_id, result)`.
-- `_in_flight: dict[cap, count]` mit `threading.Lock()` — max_parallel-Enforcement.
-- `_write_status(status_dict)` — Statusdatei via `write_json_atomic(STATUS_PATH, status)`.
-- Signal-Handler SIGTERM/SIGINT → `_stop_event.set()`.
-- `load_active_profile()` → aktive Capabilities-Liste aus der node.yaml.
+- `_in_flight: dict[cap, count]` with `threading.Lock()` — max_parallel enforcement.
+- `_write_status(status_dict)` — status file via `write_json_atomic(STATUS_PATH, status)`.
+- Signal handlers SIGTERM/SIGINT → `_stop_event.set()`.
+- `load_active_profile()` → active caps list from the node.yaml.
 
-Für den Federation Daemon ist der **Kernunterschied**: statt `run_handler` lokal
-auszuführen, schreibt er einen Forward-File in `outbox/` (Thread 2) und
-verarbeitet Inbox-Files (Thread 4). Heartbeat bleibt wie oben.
+For the federation daemon the **core difference** is: instead of running
+`run_handler` locally, it writes a forward file into `outbox/` (thread 2) and
+processes inbox files (thread 4). Heartbeat stays as above.
 
 ## nodes.common.node_utils
 
-- `BASE_DIR` — `~/.relay` (Pfad-Root).
-- `write_json_atomic(path, data)` — atomarer JSON-Write (tmp + rename).
-- `load_config()` / `load_token()` / `save_token(token, expires_at=None)` — Config/Token-Zugriff.
+- `BASE_DIR` — `~/.relay` (path root).
+- `write_json_atomic(path, data)` — atomic JSON write (tmp + rename).
+- `load_config()` / `load_token()` / `save_token(token, expires_at=None)` — config/token access.
 - `load_meta()` — iowap-agent.json.
 
 ## nodes.common.node_config
 
-- `load_active_profile()` — aktive Capabilities aus node.yaml.
+- `load_active_profile()` — active capabilities from node.yaml.
 - `current_profile_name()` / `invalidate_active_cache()`.
 
-## Wichtig für Tests
+## Important for tests
 
-Der RelayClient macht reale HTTP-Calls zur `base_url`. Für Unit-Tests den
-Client mocken (z.B. ein Fake mit gleicher Methodensignatur) oder `httpx.MockTransport`
-verwenden. Die `_effective_config()` liest `RELAY_BASE_URL` env — Tests können
-das setzen, aber am einfachsten ist ein Fake-Client.
+The RelayClient makes real HTTP calls to the `base_url`. For unit tests, mock
+the client (e.g. a fake with the same method signatures) or use
+`httpx.MockTransport`. The `_effective_config()` reads the `RELAY_BASE_URL`
+env var — tests can set it, but the simplest is a fake client.
 
-## Federation-spezifische Abweichung
+## Federation-specific deviation
 
-Der Federation Daemon heartbeats **nur** `federation` + die admin-freigegebenen
-Remote-Capabilities (nicht alle lokalen). Die lokalen Capabilities laufen im
-eigenen Relay via normalem Node-Daemon. Federation ist eine **zusätzliche**
-Capability (`federation`), die der FedNode anbietet.
+The federation daemon heartbeats **only** `federation` + the admin-approved
+remote capabilities (not all local ones). The local capabilities run in the
+own relay via the normal node daemon. Federation is an **additional**
+capability (`federation`) offered by the FedNode.
