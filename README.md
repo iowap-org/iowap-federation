@@ -40,7 +40,9 @@ ordinary tasks into the remote relay. Results come back the same way — a
 - **Transport-agnostic node** — the node only reads/writes inbox/outbox files
 - **Swappable transport** — HTTP (V1), E-Mail, P2P via factory
 - **E2EE on the message layer** — `crypto_box` (X25519 + XSalsa20-Poly1305),
-  with replay cache, size guards, and ACK-based lifecycle
+  with replay cache, size guards, and ACK-based lifecycle. Enforced when peer
+  keys are configured; a listener without crypto config still accepts
+  plaintext envelopes — status see [docs/federation.md](docs/federation.md)
 - **At-least-once delivery** — idempotent processing (dedupe on `message_id`),
   exponential backoff with full jitter
 - **Fair use** — per-capability `max_parallel` / `max_daily` enforcement

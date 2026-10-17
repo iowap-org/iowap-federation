@@ -17,7 +17,8 @@
 | Transport wrapper (Inbox/Outbox, transport-agnostic) | implemented |
 | Task forward/export path | implemented |
 | Return path (results flowing back) | open design work |
-| End-to-end encryption on the fed channel | designed, not implemented |
+| End-to-end encryption on the fed channel | implemented per message (`crypto_box`, T-101) |
+| Enforcement of E2EE across all peers | open — a listener without crypto config still accepts plaintext envelopes (both modes coexist, see `federation/listener.py`) |
 
 The status table above mirrors the repo board (`TASKS.md`); update both
 together.
