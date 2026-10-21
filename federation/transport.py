@@ -50,22 +50,27 @@ class Transport(ABC):
         pass
 
 
-def create_transport(cfg: dict[str, Any]) -> Transport:
+def create_transport(
+    cfg: dict[str, Any], *, transport_type: str | None = None
+) -> Transport:
     """Build a ``Transport`` backend from a config dict.
 
-    Dispatches on ``cfg["federation"]["transport_type"]`` (default ``"http"``).
-    Mirrors the server's ``core/db.py:create_database()`` pattern: a new
-    transport = a new class + a factory branch + a config line — no node
-    changes.
+    ``transport_type`` selects the backend explicitly. When omitted, the
+    federation-level ``federation.transport_type`` config value is used, and
+    finally ``"http"``. The explicit parameter exists because a federation
+    node may address several transports at once (one per route) — the
+    transport is a property of the route, not of the node.
     """
-    transport_type = cfg.get("federation", {}).get("transport_type", "http")
+    transport_type = transport_type or cfg.get("federation", {}).get(
+        "transport_type", "http"
+    )
     if transport_type == "http":
         from federation.transports.http_transport import HttpTransport
 
         return HttpTransport(cfg)
-    if transport_type in ("email", "p2p"):
+    if transport_type in ("email", "nextcloud", "p2p"):
         raise ValueError(
             f"transport_type {transport_type!r} not implemented yet "
-            f"(T-100 / later)"
+            f"(T-112 / later)"
         )
     raise ValueError(f"Unknown transport_type: {transport_type!r}")
