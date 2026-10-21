@@ -621,3 +621,41 @@ def test_status_file_no_index_block_when_not_wired(
     d._write_status()
     status = json.loads((isolated_fs / "federation_status.json").read_text())
     assert "index" not in status
+
+def test_reply_resolves_task_from_index_after_restart(
+    fake_client, fed_config, isolated_fs, idx
+):
+    """A reply that arrives after a restart still completes the stage.
+
+    Regression for the in-memory correlation loss: the forward message is
+    recorded in the index, then the in-memory map is cleared (simulating a
+    restart) — the reply must still resolve to its task.
+    """
+    d = make_daemon(fake_client, fed_config, isolated_fs, idx)
+    peer = fed_config.peers[0]
+    d._write_forward_file(peer, {
+        "stage_id": "stage_01",
+        "task_id": "task_42",
+        "capability": "image.gen",
+        "payload": {"remote": peer.id},
+    })
+
+    # Simulate a restart: the in-memory map is empty, the index survives.
+    d._forwarded_stages.clear()
+    assert d._forwarded_stages == {}
+
+    # Build the reply envelope and drop it into the inbox.
+    reply = {
+        "message_id": "msg_reply",
+        "type": "result",
+        "direction": "reply",
+        "capability": "image.gen",
+        "remote_task_id": "stage_01",
+        "payload": {"answer": "ok"},
+    }
+    inbox = isolated_fs / "federation" / peer.id / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "msg_reply.json").write_text(json.dumps(reply))
+
+    action = d._process_inbox_file(peer, inbox / "msg_reply.json")
+    assert action == "completed"

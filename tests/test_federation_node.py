@@ -845,3 +845,26 @@ def test_fairuse_daily_cap_blocks_after_n(
     d._claim_and_forward("image.gen")
     assert d.tasks_forwarded == 2
     assert fake_client.claim_calls == ["image.gen", "image.gen"]  # only 2
+
+def test_forward_routes_via_transport_tilde_recipient(
+    fake_client, fed_config, isolated_fs
+):
+    """The stage payload names the route; the envelope carries it."""
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    peer = fed_config.peers[0]
+    stage = {
+        "stage_id": "stage_01",
+        "task_id": "task_42",
+        "capability": "image.gen",
+        "payload": {
+            "remote": peer.id,
+            "route": "imsg~ronny.pietschke@icloud.com",
+        },
+    }
+    mid = d._write_forward_file(peer, stage)
+    assert mid is not None
+    outbox = isolated_fs / "federation" / peer.id / "outbox"
+    files = list(outbox.rglob("*.json"))
+    assert len(files) == 1
+    env = json.loads(files[0].read_text())
+    assert env["route"] == "imsg~ronny.pietschke@icloud.com"
