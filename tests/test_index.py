@@ -555,3 +555,44 @@ def test_thread_safety_smoke(idx: MetadataIndex):
 def test_close_is_idempent(idx: MetadataIndex):
     idx.close()
     idx.close()  # no error
+
+
+# --------------------------------------------------------------------- #
+# Forward correlation (T-110) — durable stage -> task mapping
+# --------------------------------------------------------------------- #
+
+def test_insert_and_resolve_forward_correlation(idx: MetadataIndex):
+    idx.insert(
+        "msg_fwd",
+        state=MessageState.QUEUED,
+        type="task",
+        remote="ronny",
+        capability="image.gen",
+        remote_task_id="stage_01",
+    )
+    idx.set_correlation("msg_fwd", task_id="task_42", stage_id="stage_01")
+    resolved = idx.resolve_correlation("stage_01")
+    assert resolved is not None
+    assert resolved["task_id"] == "task_42"
+    assert resolved["stage_id"] == "stage_01"
+    assert resolved["message_id"] == "msg_fwd"
+
+
+def test_resolve_correlation_unknown_returns_none(idx: MetadataIndex):
+    assert idx.resolve_correlation("stage_does_not_exist") is None
+
+
+def test_correlation_survives_index_reopen(tmp_path):
+    db = tmp_path / "state.db"
+    with MetadataIndex(db) as ix:
+        ix.insert("msg_fwd", state=MessageState.QUEUED, remote_task_id="stage_01")
+        ix.set_correlation("msg_fwd", task_id="task_42", stage_id="stage_01")
+    # A fresh process reads the same state.db -> the reply can still be routed.
+    with MetadataIndex(db) as ix2:
+        resolved = ix2.resolve_correlation("stage_01")
+        assert resolved is not None
+        assert resolved["task_id"] == "task_42"
+        # Cleanup on success is best-effort (D-06): unknown -> False, then gone.
+        assert ix2.delete_correlation("stage_01") is True
+        assert ix2.resolve_correlation("stage_01") is None
+        assert ix2.delete_correlation("stage_01") is False

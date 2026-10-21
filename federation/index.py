@@ -91,6 +91,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_capability     ON messages(capability);
 CREATE INDEX IF NOT EXISTS idx_messages_remote_task_id ON messages(remote_task_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created_at     ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_processed      ON messages(processed);
+CREATE TABLE IF NOT EXISTS correlations (
+    remote_task_id  TEXT PRIMARY KEY,
+    message_id      TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    stage_id        TEXT,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_correlations_message ON correlations(message_id);
 """
 
 
@@ -374,6 +382,84 @@ class MetadataIndex:
                     (remote_task_id,),
                 ).fetchone()
             )
+
+    # ------------------------------------------------------------------ #
+    # forward correlation (T-110)
+    # ------------------------------------------------------------------ #
+
+    def set_correlation(
+        self,
+        message_id: str,
+        *,
+        task_id: str,
+        stage_id: str,
+        remote_task_id: str | None = None,
+    ) -> bool:
+        """Record the stage -> task correlation for a forwarded task.
+
+        The correlation is what lets a reply (which carries only the
+        ``remote_task_id`` = our ``stage_id``) be routed back to the local
+        task. It is stored durably because the reply can arrive hours or days
+        later — after a node restart, when the in-memory map is empty.
+
+        ``remote_task_id`` defaults to ``stage_id`` (the common case: the
+        forward message's correlation id IS our stage id).
+
+        Returns ``True`` when the row was written.
+        """
+        if not message_id:
+            raise ValueError("message_id must be non-empty")
+        if not task_id:
+            raise ValueError("task_id must be non-empty")
+        corr_id = remote_task_id or stage_id
+        if not corr_id:
+            raise ValueError("stage_id (or remote_task_id) must be non-empty")
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR REPLACE INTO correlations "
+                "(remote_task_id, message_id, task_id, stage_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (corr_id, message_id, task_id, stage_id, _utcnow_iso()),
+            )
+            return cur.rowcount > 0
+
+    def resolve_correlation(self, remote_task_id: str) -> dict[str, Any] | None:
+        """Resolve a ``remote_task_id`` to its task/stage correlation.
+
+        Returns ``None`` when the correlation is unknown. This is the durable
+        replacement for the in-memory ``_forwarded_stages`` map.
+        """
+        if not remote_task_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM correlations WHERE remote_task_id = ?",
+                (remote_task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "remote_task_id": row["remote_task_id"],
+            "message_id": row["message_id"],
+            "task_id": row["task_id"],
+            "stage_id": row["stage_id"],
+            "created_at": row["created_at"],
+        }
+
+    def delete_correlation(self, remote_task_id: str) -> bool:
+        """Remove a correlation row (decision D-06 — best-effort cleanup).
+
+        ADDITIVE (T-110): called after the reply's task completes. Returns
+        ``False`` when the correlation is unknown.
+        """
+        if not remote_task_id:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM correlations WHERE remote_task_id = ?",
+                (remote_task_id,),
+            )
+            return (cur.rowcount or 0) > 0
 
     # ------------------------------------------------------------------ #
     # aggregate queries
