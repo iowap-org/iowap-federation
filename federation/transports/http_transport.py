@@ -237,6 +237,21 @@ class HttpTransport(Transport):
                 )
                 self._mirror_index_state(message_id, ACK_STATUS_REJECTED)
                 self._post_ack_back(message_id, ACK_STATUS_REJECTED)
+            elif resp.status_code == 413:
+                # T-109: the peer rejected the payload as too large. This is
+                # terminal — the same payload cannot succeed on a retry, so
+                # the message must not be re-queued. Mirror the 409 path:
+                # archive + index mirror REJECTED + ack-back.
+                log.warning(
+                    "peer rejected %s as too large — terminal", message_id
+                )
+                sender_ack.handle_inbox_response(
+                    message_id,
+                    {"status": ACK_STATUS_REJECTED, "message_id": message_id},
+                    outbox_file=f,
+                )
+                self._mirror_index_state(message_id, ACK_STATUS_REJECTED)
+                self._post_ack_back(message_id, ACK_STATUS_REJECTED)
             else:
                 log.warning(
                     "peer rejected %s: %s %s",

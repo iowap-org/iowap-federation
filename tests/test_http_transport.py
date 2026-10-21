@@ -429,3 +429,46 @@ def test_sync_outbox_post_ack_back_to_receiver(tmp_path):
     t.sync_outbox(outbox)
     assert seen_ack == [{"message_id": "ack", "status": "accepted"}]
     t.close()
+
+# --------------------------------------------------------------------- #
+# T-109: 413 (payload too large) is terminal, never retried
+# --------------------------------------------------------------------- #
+def test_oversized_response_is_terminal_not_retried(tmp_path):
+    """A 413 from the peer must NOT increment the retry counter.
+
+    Retrying an oversized payload cannot succeed — the message must go to a
+    terminal state (file archived + index row REJECTED) instead of being
+    re-queued forever.
+    """
+    from federation.index import MetadataIndex
+    from federation.lifecycle import MessageState
+
+    def handler(request):
+        if request.headers.get("Authorization") != f"Bearer {TOKEN}":
+            return httpx.Response(401)
+        if request.method == "GET" and request.url.path == "/fed/v1/discover":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path == "/fed/v1/inbox":
+            return httpx.Response(413, json={"detail": "payload too large"})
+        return httpx.Response(404)
+
+    t = make_transport(handler)
+    idx = MetadataIndex(":memory:")
+    t.index = idx
+    t.connect(URL, TOKEN)
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    (outbox / "big.json").write_text(json.dumps({"message_id": "big"}))
+    idx.insert("big", state=MessageState.QUEUED)
+
+    sent = t.sync_outbox(outbox)
+    # Not in the accepted list.
+    assert sent == []
+    # File archived (terminal).
+    assert not (outbox / "big.json").exists()
+    assert (tmp_path / "archive" / "big.json").exists()
+    row = t.index.get("big")
+    assert row is not None
+    assert row["state"] == "REJECTED"
+    assert row["retry_count"] == 0
+    t.close()
