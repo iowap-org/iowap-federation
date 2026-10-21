@@ -60,3 +60,24 @@ def ensure_federation_dirs(remote_name: str) -> tuple[Path, Path]:
     outbox.mkdir(parents=True, exist_ok=True)
     archive_dir(remote_name).mkdir(parents=True, exist_ok=True)
     return inbox, outbox
+
+
+def registry_dir() -> Path:
+    """Return the transport-registry directory. Does not create it."""
+    return federation_root() / "registry"
+
+
+def transport_dirs(transport: str) -> tuple[Path, Path, Path, Path]:
+    """Return ``(inbox, outbox, status, media)`` for one transport.
+
+    Layout (mirrors the transport registry's tree under the federation
+    root — the same ``<root>/{inbox,outbox,status,media}/<name>/`` shape
+    the registry creates on registration). Does not create anything.
+    """
+    root = federation_root()
+    return (
+        root / "inbox" / transport,
+        root / "outbox" / transport,
+        root / "status" / transport,
+        root / "media" / transport,
+    )
