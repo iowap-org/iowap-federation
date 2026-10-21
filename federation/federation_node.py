@@ -69,6 +69,7 @@ from typing import Any, Callable, Protocol
 from federation.config import NodeConfig, Peer, load_node_config
 from federation.crypto import Crypto, CryptoError
 from federation.envelope import open as envelope_open
+from federation.errors import TaskTooLargeForRoute
 from federation.fairuse import FairUseRegistry
 from federation.index import (
     MetadataIndex,
@@ -90,6 +91,7 @@ from federation.paths import (
     federation_root,
     remote_dirs,
 )
+from federation.registry import TransportRegistry
 
 log = logging.getLogger("federation.daemon")
 
@@ -222,6 +224,7 @@ class FederationDaemon:
         fairuse_registry: FairUseRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
         index: "MetadataIndex | None" = None,
+        registry: TransportRegistry | None = None,     # T-109 transport registry
     ) -> None:
         self.client = client
         self.cfg = cfg
@@ -258,6 +261,12 @@ class FederationDaemon:
         # per remote (``state.db``) may be passed in; the daemon owns the
         # archival file sweep.
         self.index = index
+
+        # T-109: transports self-register via ``registry/<name>.yaml`` under
+        # the federation root. ``root`` IS the federation root — deliberately
+        # NOT ``self.base_dir`` (decision D-02); tests run on bare tmp_path
+        # without patching BASE_DIR and base_dir ≠ federation_root().
+        self.registry = registry or TransportRegistry(federation_root())
 
         iv = intervals or {}
         self.heartbeat_interval = iv.get("heartbeat", HEARTBEAT_INTERVAL)
@@ -328,11 +337,18 @@ class FederationDaemon:
 
         ``remote_task_id`` carries OUR ``stage_id`` so the remote's reply can
         correlate back to this stage (see ``_process_inbox_file``).
+
+        T-109: the stage payload may name a ``route``
+        (``<transport>~<recipient>``); it is lifted into top-level
+        ``"route"`` and stripped from the payload (D-05) so the key does not
+        leak into the remote's re-submitted task, where it could seed a
+        re-forward loop on a third node. Absent value → ``""``.
         """
         stage_id = str(stage.get("stage_id") or "")
         task_id = str(stage.get("task_id") or "")
         capability = str(stage.get("capability") or "")
-        payload = stage.get("payload") or {}
+        payload = dict(stage.get("payload") or {})
+        route = str(payload.pop("route", "") or "")
         # If the payload already carries the remote task id (a re-forward),
         # keep it; otherwise it is the originating stage's id.
         remote_task_id = str(payload.get("remote_task_id") or stage_id)
@@ -344,6 +360,8 @@ class FederationDaemon:
             "remote_task_id": remote_task_id,
             "created_at": _utcnow_str(),
             "payload": payload,
+            # The route names the transport and the recipient address on it.
+            "route": route,
             # Provenance for the remote's inbox processor.
             "_origin": {
                 "peer": self.fed_config.node_name,
@@ -370,6 +388,19 @@ class FederationDaemon:
         message_id = envelope["message_id"]
         stage_id = envelope["_origin"]["stage_id"]
         task_id = envelope["_origin"]["task_id"]
+        # T-109: enforce the transport's declared task-size limit BEFORE the
+        # write. Metric = serialized plaintext payload (decision D-09). An
+        # empty route or an unregistered one imposes no limit (back-compat
+        # with all legacy stages).
+        route = str(envelope.get("route") or "")
+        if route:
+            limit = self.registry.max_task_bytes(route)
+            if limit is not None:
+                size = len(json.dumps(
+                    envelope.get("payload") or {}, sort_keys=True
+                ).encode("utf-8"))
+                if size > limit:
+                    raise TaskTooLargeForRoute(route, size, limit)
         dest = self._outbox_path(outbox, message_id)
         atomic_write_json(dest, envelope)
         # Register + advance the lifecycle tracker.
@@ -409,6 +440,19 @@ class FederationDaemon:
                 self.index.update_state(message_id, MessageState.QUEUED)
             except Exception as exc:  # noqa: BLE001 — index must not crash the flow
                 log.warning("index insert failed for %s: %s", message_id, exc)
+            # Record the correlation durably (T-110). The reply carries only
+            # the remote_task_id (our stage_id) — without this, a reply that
+            # arrives after a restart could not be routed back to the local
+            # task. The in-memory map below stays as a cache.
+            try:
+                self.index.set_correlation(
+                    message_id,
+                    task_id=task_id,
+                    stage_id=stage_id,
+                    remote_task_id=str(envelope.get("remote_task_id") or stage_id),
+                )
+            except Exception as exc:  # noqa: BLE001 — index must not break the forward
+                log.warning("index set_correlation failed for %s: %s", message_id, exc)
         # Record correlation so the reply can complete our stage.
         if stage_id:
             with self._lock:
@@ -479,7 +523,15 @@ class FederationDaemon:
             if policy is not None:
                 policy.release()
             return
-        message_id = self._write_forward_file(peer, stage)
+        try:
+            message_id = self._write_forward_file(peer, stage)
+        except TaskTooLargeForRoute as exc:
+            # T-109 (D-08): the stage is dropped (terminal) — the claim
+            # thread must NOT die, and the oversize stage is not re-queued
+            # (retrying the same payload cannot succeed). ``None`` falls
+            # into the branch below, which releases the fair-use slot.
+            log.error("task too large for route — dropping (terminal): %s", exc)
+            message_id = None
         if message_id is not None:
             self.tasks_forwarded += 1
             log.info(
@@ -637,8 +689,25 @@ class FederationDaemon:
                 )
                 action = "skipped"
             else:
+                # Resolve the correlation durably (index = source of truth,
+                # RAM = cache). Index lookup FIRST (read-only), then the
+                # RAM pop ALWAYS — it keeps the status file's
+                # ``pending_replies`` counter accurate (decision D-07).
+                task_id = ""
+                if self.index is not None:
+                    try:
+                        corr = self.index.resolve_correlation(remote_task_id)
+                        if corr is not None:
+                            task_id = str(corr.get("task_id") or "")
+                    except Exception as exc:  # noqa: BLE001 — index failure must not drop the reply path
+                        log.warning(
+                            "index resolve_correlation failed for %s: %s",
+                            remote_task_id, exc,
+                        )
                 with self._lock:
-                    task_id = self._forwarded_stages.pop(remote_task_id, "")
+                    ram_task_id = self._forwarded_stages.pop(remote_task_id, "")
+                    if not task_id:
+                        task_id = ram_task_id
                     cur = self._in_flight.get(FEDERATION_CAP, 0)
                     if cur > 0:
                         self._in_flight[FEDERATION_CAP] = cur - 1
@@ -676,6 +745,9 @@ class FederationDaemon:
                         # COMPLETED (correlated via remote_task_id).
                         if self.index is not None:
                             try:
+                                self.index.delete_correlation(
+                                    remote_task_id
+                                )  # D-06 — best-effort cleanup
                                 self.index.mark_processed(message_id)
                                 fwd_row = self.index.get_by_remote_task_id(remote_task_id)
                                 if fwd_row is not None:
@@ -994,6 +1066,13 @@ class FederationDaemon:
     def _sync_loop(self) -> None:
         """Thread 3: per-peer sync cycle (outbox → inbox)."""
         while not self._stop_event.is_set():
+            # T-109: pick up newly registered (or removed) transports — once
+            # per sync cycle, BEFORE the per-peer loop. A bad manifest must
+            # not kill the loop.
+            try:
+                self.registry.reconcile()
+            except Exception as exc:  # noqa: BLE001 — a bad manifest must not kill the loop
+                log.warning("registry reconcile failed: %s", exc)
             for peer in self.fed_config.peers:
                 if self._stop_event.is_set():
                     break

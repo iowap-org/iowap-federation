@@ -18,7 +18,9 @@ import pytest
 
 from federation import paths as fed_paths
 from federation.config import NodeConfig, Peer
+from federation.errors import TaskTooLargeForRoute
 from federation.federation_node import FederationDaemon, build_parser, main
+from federation.manifest import TransportManifest
 
 
 # --------------------------------------------------------------------- #
@@ -845,3 +847,87 @@ def test_fairuse_daily_cap_blocks_after_n(
     d._claim_and_forward("image.gen")
     assert d.tasks_forwarded == 2
     assert fake_client.claim_calls == ["image.gen", "image.gen"]  # only 2
+
+def test_forward_routes_via_transport_tilde_recipient(
+    fake_client, fed_config, isolated_fs
+):
+    """The stage payload names the route; the envelope carries it."""
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    peer = fed_config.peers[0]
+    stage = {
+        "stage_id": "stage_01",
+        "task_id": "task_42",
+        "capability": "image.gen",
+        "payload": {
+            "remote": peer.id,
+            "route": "imsg~ronny.pietschke@icloud.com",
+        },
+    }
+    mid = d._write_forward_file(peer, stage)
+    assert mid is not None
+    outbox = isolated_fs / "federation" / peer.id / "outbox"
+    files = list(outbox.rglob("*.json"))
+    assert len(files) == 1
+    env = json.loads(files[0].read_text())
+    assert env["route"] == "imsg~ronny.pietschke@icloud.com"
+
+
+def test_oversized_task_is_rejected_before_forwarding(
+    fake_client, fed_config, isolated_fs
+):
+    """A task larger than the transport's declared limit never reaches the outbox."""
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    peer = fed_config.peers[0]
+    d.registry.register(
+        "email", TransportManifest(name="email", max_task_bytes=1024)
+    )
+    stage = {
+        "stage_id": "stage_01",
+        "task_id": "task_42",
+        "capability": "image.gen",
+        "payload": {
+            "remote": peer.id,
+            "route": "email~ronny@example.org",
+            "blob": "x" * 5000,
+        },
+    }
+    with pytest.raises(TaskTooLargeForRoute):
+        d._write_forward_file(peer, stage)
+    outbox = isolated_fs / "federation" / peer.id / "outbox"
+    assert not list(outbox.rglob("*.json"))
+
+
+def test_task_within_limit_is_forwarded(fake_client, fed_config, isolated_fs):
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    peer = fed_config.peers[0]
+    d.registry.register(
+        "email", TransportManifest(name="email", max_task_bytes=1024 * 1024)
+    )
+    stage = {
+        "stage_id": "stage_02",
+        "task_id": "task_43",
+        "capability": "image.gen",
+        "payload": {
+            "remote": peer.id,
+            "route": "email~ronny@example.org",
+            "blob": "x" * 100,
+        },
+    }
+    mid = d._write_forward_file(peer, stage)
+    assert mid is not None
+
+
+def test_daemon_reconciles_registry_on_start(fake_client, fed_config, isolated_fs):
+    """Dropping a manifest into registry/ registers the transport at runtime.
+
+    The daemon's registry is rooted at the federation root (D-02) — so the
+    transport tree appears under ``federation/outbox/<name>`` (correction C1),
+    not under ``federation/<name>/outbox``.
+    """
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    reg_dir = isolated_fs / "federation" / "registry"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    (reg_dir / "email.yaml").write_text("name: email\nmax_task_bytes: 10485760\n")
+    d.registry.reconcile()
+    assert "email" in d.registry.transports
+    assert (isolated_fs / "federation" / "outbox" / "email").is_dir()
