@@ -18,7 +18,9 @@ import pytest
 
 from federation import paths as fed_paths
 from federation.config import NodeConfig, Peer
+from federation.errors import TaskTooLargeForRoute
 from federation.federation_node import FederationDaemon, build_parser, main
+from federation.manifest import TransportManifest
 
 
 # --------------------------------------------------------------------- #
@@ -868,3 +870,48 @@ def test_forward_routes_via_transport_tilde_recipient(
     assert len(files) == 1
     env = json.loads(files[0].read_text())
     assert env["route"] == "imsg~ronny.pietschke@icloud.com"
+
+
+def test_oversized_task_is_rejected_before_forwarding(
+    fake_client, fed_config, isolated_fs
+):
+    """A task larger than the transport's declared limit never reaches the outbox."""
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    peer = fed_config.peers[0]
+    d.registry.register(
+        "email", TransportManifest(name="email", max_task_bytes=1024)
+    )
+    stage = {
+        "stage_id": "stage_01",
+        "task_id": "task_42",
+        "capability": "image.gen",
+        "payload": {
+            "remote": peer.id,
+            "route": "email~ronny@example.org",
+            "blob": "x" * 5000,
+        },
+    }
+    with pytest.raises(TaskTooLargeForRoute):
+        d._write_forward_file(peer, stage)
+    outbox = isolated_fs / "federation" / peer.id / "outbox"
+    assert not list(outbox.rglob("*.json"))
+
+
+def test_task_within_limit_is_forwarded(fake_client, fed_config, isolated_fs):
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    peer = fed_config.peers[0]
+    d.registry.register(
+        "email", TransportManifest(name="email", max_task_bytes=1024 * 1024)
+    )
+    stage = {
+        "stage_id": "stage_02",
+        "task_id": "task_43",
+        "capability": "image.gen",
+        "payload": {
+            "remote": peer.id,
+            "route": "email~ronny@example.org",
+            "blob": "x" * 100,
+        },
+    }
+    mid = d._write_forward_file(peer, stage)
+    assert mid is not None

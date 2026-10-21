@@ -69,6 +69,7 @@ from typing import Any, Callable, Protocol
 from federation.config import NodeConfig, Peer, load_node_config
 from federation.crypto import Crypto, CryptoError
 from federation.envelope import open as envelope_open
+from federation.errors import TaskTooLargeForRoute
 from federation.fairuse import FairUseRegistry
 from federation.index import (
     MetadataIndex,
@@ -90,6 +91,7 @@ from federation.paths import (
     federation_root,
     remote_dirs,
 )
+from federation.registry import TransportRegistry
 
 log = logging.getLogger("federation.daemon")
 
@@ -222,6 +224,7 @@ class FederationDaemon:
         fairuse_registry: FairUseRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
         index: "MetadataIndex | None" = None,
+        registry: TransportRegistry | None = None,     # T-109 transport registry
     ) -> None:
         self.client = client
         self.cfg = cfg
@@ -258,6 +261,12 @@ class FederationDaemon:
         # per remote (``state.db``) may be passed in; the daemon owns the
         # archival file sweep.
         self.index = index
+
+        # T-109: transports self-register via ``registry/<name>.yaml`` under
+        # the federation root. ``root`` IS the federation root — deliberately
+        # NOT ``self.base_dir`` (decision D-02); tests run on bare tmp_path
+        # without patching BASE_DIR and base_dir ≠ federation_root().
+        self.registry = registry or TransportRegistry(federation_root())
 
         iv = intervals or {}
         self.heartbeat_interval = iv.get("heartbeat", HEARTBEAT_INTERVAL)
@@ -379,6 +388,19 @@ class FederationDaemon:
         message_id = envelope["message_id"]
         stage_id = envelope["_origin"]["stage_id"]
         task_id = envelope["_origin"]["task_id"]
+        # T-109: enforce the transport's declared task-size limit BEFORE the
+        # write. Metric = serialized plaintext payload (decision D-09). An
+        # empty route or an unregistered one imposes no limit (back-compat
+        # with all legacy stages).
+        route = str(envelope.get("route") or "")
+        if route:
+            limit = self.registry.max_task_bytes(route)
+            if limit is not None:
+                size = len(json.dumps(
+                    envelope.get("payload") or {}, sort_keys=True
+                ).encode("utf-8"))
+                if size > limit:
+                    raise TaskTooLargeForRoute(route, size, limit)
         dest = self._outbox_path(outbox, message_id)
         atomic_write_json(dest, envelope)
         # Register + advance the lifecycle tracker.
@@ -501,7 +523,15 @@ class FederationDaemon:
             if policy is not None:
                 policy.release()
             return
-        message_id = self._write_forward_file(peer, stage)
+        try:
+            message_id = self._write_forward_file(peer, stage)
+        except TaskTooLargeForRoute as exc:
+            # T-109 (D-08): the stage is dropped (terminal) — the claim
+            # thread must NOT die, and the oversize stage is not re-queued
+            # (retrying the same payload cannot succeed). ``None`` falls
+            # into the branch below, which releases the fair-use slot.
+            log.error("task too large for route — dropping (terminal): %s", exc)
+            message_id = None
         if message_id is not None:
             self.tasks_forwarded += 1
             log.info(
