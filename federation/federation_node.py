@@ -1066,6 +1066,13 @@ class FederationDaemon:
     def _sync_loop(self) -> None:
         """Thread 3: per-peer sync cycle (outbox → inbox)."""
         while not self._stop_event.is_set():
+            # T-109: pick up newly registered (or removed) transports — once
+            # per sync cycle, BEFORE the per-peer loop. A bad manifest must
+            # not kill the loop.
+            try:
+                self.registry.reconcile()
+            except Exception as exc:  # noqa: BLE001 — a bad manifest must not kill the loop
+                log.warning("registry reconcile failed: %s", exc)
             for peer in self.fed_config.peers:
                 if self._stop_event.is_set():
                     break

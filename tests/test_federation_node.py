@@ -915,3 +915,19 @@ def test_task_within_limit_is_forwarded(fake_client, fed_config, isolated_fs):
     }
     mid = d._write_forward_file(peer, stage)
     assert mid is not None
+
+
+def test_daemon_reconciles_registry_on_start(fake_client, fed_config, isolated_fs):
+    """Dropping a manifest into registry/ registers the transport at runtime.
+
+    The daemon's registry is rooted at the federation root (D-02) — so the
+    transport tree appears under ``federation/outbox/<name>`` (correction C1),
+    not under ``federation/<name>/outbox``.
+    """
+    d = make_daemon(fake_client, fed_config, isolated_fs)
+    reg_dir = isolated_fs / "federation" / "registry"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    (reg_dir / "email.yaml").write_text("name: email\nmax_task_bytes: 10485760\n")
+    d.registry.reconcile()
+    assert "email" in d.registry.transports
+    assert (isolated_fs / "federation" / "outbox" / "email").is_dir()
