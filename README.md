@@ -37,7 +37,10 @@ ordinary tasks into the remote relay. Results come back the same way — a
 
 - **No relay code changes** — Federation is pure node code
 - **Federation is a capability** — the node heartbeats `federation`, nothing else
-- **Transport-agnostic node** — the node only reads/writes inbox/outbox files
+- **Transport-agnostic node** — the node only reads/writes inbox/outbox files.
+  A transport registers itself with `registry/<name>.yaml` and declares its task
+  size limit (`max_task_bytes`); messages are addressed as
+  `<transport>~<recipient>` (e.g. `imsg~ronny.pietschke@icloud.com`).
 - **Swappable transport** — HTTP (V1), E-Mail, P2P via factory
 - **E2EE on the message layer** — `crypto_box` (X25519 + XSalsa20-Poly1305),
   with replay cache, size guards, and ACK-based lifecycle. Enforced when peer

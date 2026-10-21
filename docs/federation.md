@@ -18,6 +18,9 @@
 | Task forward/export path | implemented |
 | Return path (results flowing back) | open design work |
 | End-to-end encryption on the fed channel | implemented per message (`crypto_box`, T-101) |
+| Route addressing (`<transport>~<recipient>`) | implemented (T-109) |
+| Transport self-registration + `max_task_bytes` | implemented (T-109) |
+| Durable reply correlation (survives restart) | implemented (T-110) |
 | Enforcement of E2EE across all peers | open — a listener without crypto config still accepts plaintext envelopes (both modes coexist, see `federation/listener.py`) |
 
 The status table above mirrors the repo board (`TASKS.md`); update both
