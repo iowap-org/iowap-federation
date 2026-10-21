@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from federation.config import NodeConfig, Peer, load_node_config, load_node_config_from_dict
+from federation.config import (
+    NodeConfig,
+    Peer,
+    Recipient,
+    load_node_config,
+    load_node_config_from_dict,
+)
 
 
 def test_peer_normalises_trailing_slash():
@@ -111,3 +117,62 @@ federation:
     assert cfg.peers[0].id == "fed-b"
     assert cfg.peers[0].token == "fed_t_secret"
     assert cfg.offer == [{"capability": "image.gen"}]
+
+
+# --------------------------------------------------------------------- #
+# Recipient (T-109) — transport-independent age key
+# --------------------------------------------------------------------- #
+
+
+def test_recipient_carries_age_key_and_routes():
+    r = Recipient(
+        id="ronny",
+        age_recipient="age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p",
+        routes=["imsg~ronny.pietschke@icloud.com", "email~ronny@example.org"],
+    )
+    assert r.id == "ronny"
+    assert r.age_recipient.startswith("age1")
+    assert len(r.routes) == 2
+
+
+def test_recipient_routes_must_be_unique():
+    with pytest.raises(ValueError, match="unique"):
+        Recipient(
+            id="ronny",
+            age_recipient="age1x",
+            routes=["imsg~ronny", "imsg~ronny"],
+        )
+
+
+def test_recipient_without_age_key_is_rejected():
+    # A recipient without an age key cannot be addressed securely -> refuse
+    # at config time rather than failing at encryption time.
+    with pytest.raises(ValueError, match="age_recipient"):
+        Recipient(id="ronny", age_recipient="", routes=["imsg~ronny"])
+
+
+def test_load_from_dict_recipients_loaded():
+    raw = {
+        "node_name": "fed-a",
+        "federation": {
+            "recipients": [
+                {
+                    "id": "ronny",
+                    "age_recipient": "age1x",
+                    "routes": [
+                        "imsg~ronny.pietschke@icloud.com",
+                        "email~ronny@example.org",
+                    ],
+                }
+            ]
+        },
+    }
+    cfg = load_node_config_from_dict(raw)
+    r = cfg.recipient("ronny")
+    assert r.age_recipient == "age1x"
+    assert r.routes == (
+        "imsg~ronny.pietschke@icloud.com",
+        "email~ronny@example.org",
+    )
+    # A missing 'recipients' key degrades to an empty list (like 'peers').
+    assert load_node_config_from_dict({"federation": {}}).recipients == []

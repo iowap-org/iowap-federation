@@ -19,11 +19,18 @@ from typing import Any
 import yaml
 
 from federation import paths as _paths
+from federation.routing import parse_route
 
 
 @dataclass(frozen=True)
 class Peer:
-    """A single configured remote FedNode peer."""
+    """A single configured remote FedNode peer.
+
+    A peer is a transport + endpoint pair (HTTP transport in T-109).
+    Transport-independent *addressing* (``<transport>~<recipient>``, age key
+    per recipient) lives in :class:`Recipient` since T-109; peers stay the
+    V1 HTTP config path.
+    """
 
     id: str
     endpoint: str
@@ -48,6 +55,40 @@ class Peer:
         return {"Authorization": f"Bearer {self.token}"}
 
 
+@dataclass(frozen=True)
+class Recipient:
+    """A remote recipient the federation node can address.
+
+    A recipient is **transport-independent**: the same person may be reachable
+    over several transports (iMessage, e-mail, a shared folder), each with its
+    own route. The age key belongs to the **recipient**, not to the transport —
+    so ``imsg~ronny`` and ``email~ronny`` are encrypted to the same key.
+
+    ``routes`` are ``<transport>~<recipient>`` strings (see
+    :mod:`federation.routing`).
+    """
+
+    id: str
+    age_recipient: str
+    routes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            raise ValueError("recipient id must be non-empty")
+        if not self.age_recipient:
+            raise ValueError(
+                f"recipient {self.id!r}: age_recipient must be non-empty "
+                "(a recipient without an age key cannot be addressed securely)"
+            )
+        if len(set(self.routes)) != len(self.routes):
+            raise ValueError(
+                f"recipient {self.id!r}: routes must be unique"
+            )
+        # Validate the route format eagerly so a typo fails at config time.
+        for raw in self.routes:
+            parse_route(raw)
+
+
 @dataclass
 class NodeConfig:
     """Resolved Federation Node configuration."""
@@ -63,12 +104,22 @@ class NodeConfig:
     # optional override (e.g. for a single shared token); defaults to None,
     # meaning "accept any configured peer token".
     listener_token: str | None = None
+    # Transport-independent recipients (T-109): a person addressable over
+    # several transports, each with its own route, sharing one age key.
+    # Sourced from ``federation.recipients`` in node.yaml.
+    recipients: list[Recipient] = field(default_factory=list)
 
     def peer(self, peer_id: str) -> Peer:
         for p in self.peers:
             if p.id == peer_id:
                 return p
         raise KeyError(f"unknown peer: {peer_id!r}")
+
+    def recipient(self, recipient_id: str) -> Recipient:
+        for r in self.recipients:
+            if r.id == recipient_id:
+                return r
+        raise KeyError(f"unknown recipient: {recipient_id!r}")
 
     def accepted_tokens(self) -> set[str]:
         """Tokens this node will accept on its listener."""
@@ -116,9 +167,20 @@ def load_node_config_from_dict(raw: dict[str, Any]) -> NodeConfig:
             )
         )
     offer = fed_section.get("offer", []) or []
+    recipients_raw = fed_section.get("recipients", []) or []
+    recipients: list[Recipient] = []
+    for entry in recipients_raw:
+        recipients.append(
+            Recipient(
+                id=entry["id"],
+                age_recipient=entry["age_recipient"],
+                routes=tuple(entry.get("routes", []) or []),
+            )
+        )
     return NodeConfig(
         node_name=raw.get("node_name", "federation"),
         peers=peers,
         offer=list(offer),
         listener_token=fed_section.get("listener_token"),
+        recipients=recipients,
     )
