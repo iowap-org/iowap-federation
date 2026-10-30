@@ -16,15 +16,17 @@
 |---|---|
 | Transport wrapper (Inbox/Outbox, transport-agnostic) | implemented |
 | Task forward/export path | implemented |
-| Return path (results flowing back) | open design work |
+| Return path — sync (reply envelope in inbox completes the claimed stage) | implemented (T-110) |
+| Return path — async result leg (`GET /fed/v1/results/{id}` polling) | open — endpoint returns 501 until T-102 (`get_results` in `federation/listener.py`) |
 | End-to-end encryption on the fed channel | implemented per message (`crypto_box`, T-101) |
 | Route addressing (`<transport>~<recipient>`) | implemented (T-109) |
 | Transport self-registration + `max_task_bytes` | implemented (T-109) |
 | Durable reply correlation (survives restart) | implemented (T-110) |
 | Enforcement of E2EE across all peers | open — a listener without crypto config still accepts plaintext envelopes (both modes coexist, see `federation/listener.py`) |
 
-The status table above mirrors the repo board (`TASKS.md`); update both
-together.
+The status table above mirrors the project board —
+`~/.hermes/projects/iowap-federation/TASKS.md` (Hermes project board, not
+part of this repo); update both together.
 
 ## Heartbeat-reported configuration (inventory)
 
@@ -34,27 +36,27 @@ boundary — the node tail is what the relay sees, the worker part stays
 local. It is the boundary a federation node extends.
 
 **Reported today (node tail)** — built in
-`iowap-node/nodes/common/relay_client.py:773-849` (`_build_heartbeat_payload`),
+`iowap-node/nodes/common/relay_client.py` (`_build_heartbeat_payload`),
 accepted by `POST /relay/v2/discovery/worker-heartbeat`
-(`iowap-server/api/v2/discovery.py:59-87`) in **replace mode**
+(`iowap-server/api/v2/discovery.py` `discovery_worker_heartbeat`) in **replace mode**
 (`replace_capabilities=True`):
 
 | Field | Source | Server-side effect |
 |---|---|---|
-| `status` | active profile (`node_config.py:754` `load_active_status`) | `busy`/`idle`/`online`; drives the auto-busy logic |
+| `status` | active profile (`node_config.py` `load_active_status`) | `busy`/`idle`/`online`; drives the auto-busy logic |
 | `available`, `load`, `load_source`, `load_cap` | measured / config | `load_source` names the rung of the load chain (cgroup2/cgroup/loadavg) so the dashboard can tell measurements apart |
 | `queue_depth` | in-flight map | sum over advertised capabilities |
-| `capabilities[]` | active profile | `name`, `version`, `available` (derived from `max_parallel`, `relay_client.py:782`), plus `type`, `description`, `input_schema`, `upload_modes`, `result_path_hints` |
+| `capabilities[]` | active profile | `name`, `version`, `available` (derived from `max_parallel` inside `_build_heartbeat_payload`), plus `type`, `description`, `input_schema`, `upload_modes`, `result_path_hints` |
 | `node_name`, `description` | meta file | surfaced via `node list` / `node info` |
-| `forward_slots` | node.yaml (`node_config.py:707` `load_forward_slots`) | node-declared slots; server replaces its declaration rows (`iowap-server/core/forward.py:205` `replace_forward_slots`) |
+| `forward_slots` | node.yaml (`node_config.py` `load_forward_slots`) | node-declared slots; server replaces its declaration rows (`iowap-server/core/forward.py` `replace_forward_slots`) |
 
 The per-capability metadata is forwarded so the server can populate
-`node_capabilities` (`iowap-server/core/db.py:516`) and resolve
+the `node_capabilities` table (schema in `iowap-server/core/db.py`) and resolve
 `capability_details` on claim/task-view without an extra discovery
 round-trip.
 
 **Declared locally and deliberately not reported (worker part)** — the
-profile schema allows these keys (`node_config.py:122`), the heartbeat
+profile schema allows these keys (`node_config.py` `validate_with_schema`), the heartbeat
 builder does not send them:
 
 | Field | Why it stays local |
@@ -62,7 +64,7 @@ builder does not send them:
 | `handler` | the executable path is meaningless to the server — it never runs the handler |
 | `timeout` | execution detail of the worker part |
 | `max_parallel` | the server learns the *result* via `available`; the local ceiling stays local |
-| `auto_publish` | a local publishing decision, applied before the heartbeat (`relay_client.py:775` skips the capability entirely) |
+| `auto_publish` | a local publishing decision, applied before the heartbeat (`_build_heartbeat_payload` skips the capability entirely) |
 | `claimable` | a local routing hint |
 | `config` | arbitrary worker-part configuration; may contain local paths and secrets |
 
